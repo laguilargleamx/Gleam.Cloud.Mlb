@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#0f172a" />
+  <rect x="40" y="40" width="432" height="432" rx="104" fill="#1f2937" />
+  <circle cx="166" cy="184" r="44" fill="#ef4444" />
+  <circle cx="346" cy="184" r="44" fill="#3b82f6" />
+  <path
+    d="M118 312c0-66 57-118 138-118h0c81 0 138 52 138 118v20H118v-20z"
+    fill="#f8fafc"
+    opacity="0.94"
+  />
+  <rect x="128" y="330" width="256" height="72" rx="18" fill="#f8fafc" />
+  <text
+    x="256"
+    y="377"
+    font-family="Arial, sans-serif"
+    font-size="48"
+    font-weight="700"
+    text-anchor="middle"
+    fill="#111827"
+  >
+    MLB
+  </text>
+</svg>
