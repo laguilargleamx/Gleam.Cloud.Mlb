@@ -78,7 +78,7 @@ export function getTeamAbbreviation(team) {
   }
 
   if (!team?.name) {
-    return "---";
+    return "----";
   }
 
   const words = team.name.split(" ");
