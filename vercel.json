@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/odds-api/:path*",
+      "destination": "https://api.the-odds-api.com/:path*"
+    }
+  ]
+}
