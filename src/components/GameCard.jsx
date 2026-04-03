@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   fetchGameLineups,
+  fetchPitcherGameLogs,
   fetchPlayersHittingStatsByIds,
   fetchPlayersHittingStreaksByIds,
   getPitcherImageUrl,
@@ -46,14 +47,59 @@ function TeamRow({ side }) {
   );
 }
 
-function PitcherBlock({ team, side, era }) {
+function formatSoPerGame(strikeoutsPerGame) {
+  if (
+    strikeoutsPerGame === undefined ||
+    strikeoutsPerGame === null ||
+    strikeoutsPerGame === ""
+  ) {
+    return null;
+  }
+  const numeric = Number(strikeoutsPerGame);
+  if (Number.isNaN(numeric)) {
+    return null;
+  }
+  return numeric.toFixed(1);
+}
+
+function hasGameStarted(game) {
+  const abstractState = `${game?.status?.abstractGameState ?? ""}`.toLowerCase();
+  const detailedState = `${game?.status?.detailedState ?? ""}`.toLowerCase();
+  if (abstractState === "live" || abstractState === "final") {
+    return true;
+  }
+  return (
+    detailedState.includes("in progress") ||
+    detailedState.includes("warmup") ||
+    detailedState.includes("final")
+  );
+}
+
+function PitcherBlock({
+  team,
+  side,
+  era,
+  strikeoutsPerGame,
+  strikeoutLine,
+  gameStarted,
+  oddsLoading,
+  onOpenDetails
+}) {
   const pitcher = side.probablePitcher;
   const imageUrl = getPitcherImageUrl(pitcher?.id);
   const code = getTeamAbbreviation(team);
   const eraLabel = era ?? "--";
+  const soPerGameLabel = formatSoPerGame(strikeoutsPerGame);
+  const hasPitcher = Boolean(pitcher?.id);
 
   return (
-    <div className="pitcher-block">
+    <button
+      type="button"
+      className={`pitcher-block ${hasPitcher ? "pitcher-block-clickable" : ""}`}
+      onClick={hasPitcher ? onOpenDetails : undefined}
+      disabled={!hasPitcher}
+      title={hasPitcher ? "Ver juegos del pitcher en temporada" : undefined}
+    >
       <div className="pitcher-avatar">
         {imageUrl ? (
           <img
@@ -69,8 +115,96 @@ function PitcherBlock({ team, side, era }) {
       </div>
       <div className="pitcher-text">
         <span>{code}:</span>
-        <strong>{pitcher?.fullName ?? "Sin pitcher probable"}</strong>
+        <strong>
+          {pitcher?.fullName ?? "Sin pitcher probable"}
+          {soPerGameLabel ? ` ${soPerGameLabel} SO/J` : ""}
+        </strong>
         <small>ERA {eraLabel}</small>
+        {gameStarted ? (
+          <small>Juego iniciado</small>
+        ) : oddsLoading ? (
+          <small>Cargando odds...</small>
+        ) : strikeoutLine?.line !== undefined ? (
+          <small>
+            {strikeoutLine?.sportsbookTitle ?? "Sportsbook"}: {strikeoutLine.line} K
+          </small>
+        ) : (
+          <small>Sin linea de sportsbook</small>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function formatGameLogDate(dateString) {
+  if (!dateString) {
+    return "-";
+  }
+  const date = new Date(`${dateString}T00:00:00`);
+  if (Number.isNaN(date.getTime())) {
+    return dateString;
+  }
+  return date.toLocaleDateString("es-ES", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric"
+  });
+}
+
+function PitcherGameLogModal({
+  pitcherName,
+  season,
+  gameLogs,
+  loading,
+  error,
+  onClose
+}) {
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal-content"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Juegos de ${pitcherName}`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="modal-header">
+          <h3>{pitcherName}</h3>
+          <button type="button" className="modal-close" onClick={onClose} aria-label="Cerrar">
+            x
+          </button>
+        </div>
+        <p className="modal-subtitle">Temporada {season} - Game log de pitcheo</p>
+        {loading ? <p>Cargando juegos...</p> : null}
+        {error ? <p className="error">{error}</p> : null}
+        {!loading && !error ? (
+          gameLogs.length ? (
+            <div className="modal-table-wrap">
+              <table className="modal-table">
+                <thead>
+                  <tr>
+                    <th>Fecha</th>
+                    <th>Vs</th>
+                    <th>IP</th>
+                    <th>SO</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {gameLogs.map((log) => (
+                    <tr key={`${log.gameDate}-${log.opponentName}`}>
+                      <td>{formatGameLogDate(log.gameDate)}</td>
+                      <td>{log.opponentName}</td>
+                      <td>{log.inningsPitched}</td>
+                      <td>{log.strikeOuts}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p>No hay juegos de temporada para mostrar.</p>
+          )
+        ) : null}
       </div>
     </div>
   );
@@ -122,7 +256,14 @@ function StatsTable({ title, players, statsByPlayerId, streaksByPlayerId }) {
   );
 }
 
-export default function GameCard({ game, pitcherErasById }) {
+export default function GameCard({
+  game,
+  pitcherErasById,
+  pitcherStrikeoutsPerGameById,
+  pitcherStrikeoutLinesById,
+  oddsLoading,
+  onRefreshOddsForGame
+}) {
   const [lineups, setLineups] = useState(null);
   const [lineupStatsByPlayerId, setLineupStatsByPlayerId] = useState({});
   const [lineupStreaksByPlayerId, setLineupStreaksByPlayerId] = useState({});
@@ -132,6 +273,14 @@ export default function GameCard({ game, pitcherErasById }) {
   const [lineupStatsLoading, setLineupStatsLoading] = useState(false);
   const [lineupError, setLineupError] = useState("");
   const [showStatsInfo, setShowStatsInfo] = useState(false);
+  const [pitcherModal, setPitcherModal] = useState({
+    open: false,
+    pitcherName: "",
+    gameLogs: [],
+    loading: false,
+    error: ""
+  });
+  const [oddsRefreshLoading, setOddsRefreshLoading] = useState(false);
 
   const localTime = new Date(game.gameDate).toLocaleTimeString([], {
     hour: "numeric",
@@ -139,6 +288,9 @@ export default function GameCard({ game, pitcherErasById }) {
   });
   const awayPitcherId = game.teams.away.probablePitcher?.id;
   const homePitcherId = game.teams.home.probablePitcher?.id;
+  const season = game.season ?? game.officialDate?.split("-")[0];
+  const gameStarted = hasGameStarted(game);
+  const effectiveOddsLoading = oddsLoading || oddsRefreshLoading;
 
   async function handleToggleLineup() {
     const nextOpen = !lineupOpen;
@@ -177,6 +329,71 @@ export default function GameCard({ game, pitcherErasById }) {
     setLineupLoading(false);
   }
 
+  async function handlePitcherDetailsOpen(side) {
+    const pitcherId = side?.probablePitcher?.id;
+    const pitcherName = side?.probablePitcher?.fullName ?? "Pitcher";
+    if (!pitcherId || !season) {
+      return;
+    }
+
+    setPitcherModal({
+      open: true,
+      pitcherName,
+      gameLogs: [],
+      loading: true,
+      error: ""
+    });
+
+    try {
+      const logs = await fetchPitcherGameLogs(pitcherId, season);
+      setPitcherModal({
+        open: true,
+        pitcherName,
+        gameLogs: logs,
+        loading: false,
+        error: ""
+      });
+    } catch (error) {
+      setPitcherModal({
+        open: true,
+        pitcherName,
+        gameLogs: [],
+        loading: false,
+        error: "No se pudieron cargar los juegos del pitcher."
+      });
+    }
+  }
+
+  function handlePitcherDetailsClose() {
+    setPitcherModal((current) => ({ ...current, open: false }));
+  }
+
+  async function handleRefreshOddsClick() {
+    if (!onRefreshOddsForGame) {
+      return;
+    }
+    setOddsRefreshLoading(true);
+    await onRefreshOddsForGame(game);
+    setOddsRefreshLoading(false);
+  }
+
+  useEffect(() => {
+    if (!pitcherModal.open) {
+      return undefined;
+    }
+
+    function onKeyDown(event) {
+      if (event.key === "Escape") {
+        handlePitcherDetailsClose();
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [pitcherModal.open]);
+
   return (
     <article className="game-card">
       <div className="game-meta">
@@ -196,12 +413,33 @@ export default function GameCard({ game, pitcherErasById }) {
           team={game.teams.away.team}
           side={game.teams.away}
           era={pitcherErasById?.[awayPitcherId]}
+          strikeoutsPerGame={pitcherStrikeoutsPerGameById?.[awayPitcherId]}
+          strikeoutLine={pitcherStrikeoutLinesById?.[awayPitcherId]}
+          gameStarted={gameStarted}
+          oddsLoading={effectiveOddsLoading}
+          onOpenDetails={() => handlePitcherDetailsOpen(game.teams.away)}
         />
         <PitcherBlock
           team={game.teams.home.team}
           side={game.teams.home}
           era={pitcherErasById?.[homePitcherId]}
+          strikeoutsPerGame={pitcherStrikeoutsPerGameById?.[homePitcherId]}
+          strikeoutLine={pitcherStrikeoutLinesById?.[homePitcherId]}
+          gameStarted={gameStarted}
+          oddsLoading={effectiveOddsLoading}
+          onOpenDetails={() => handlePitcherDetailsOpen(game.teams.home)}
         />
+      </div>
+
+      <div className="odds-actions">
+        <button
+          type="button"
+          className="lineup-toggle odds-refresh-button"
+          onClick={handleRefreshOddsClick}
+          disabled={oddsRefreshLoading}
+        >
+          {oddsRefreshLoading ? "Refrescando odds..." : "Refrescar odds (este juego)"}
+        </button>
       </div>
 
       <button
@@ -297,6 +535,16 @@ export default function GameCard({ game, pitcherErasById }) {
             </>
           ) : null}
         </div>
+      ) : null}
+      {pitcherModal.open ? (
+        <PitcherGameLogModal
+          pitcherName={pitcherModal.pitcherName}
+          season={season}
+          gameLogs={pitcherModal.gameLogs}
+          loading={pitcherModal.loading}
+          error={pitcherModal.error}
+          onClose={handlePitcherDetailsClose}
+        />
       ) : null}
     </article>
   );
