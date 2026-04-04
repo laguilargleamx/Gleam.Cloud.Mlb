@@ -5,7 +5,8 @@ import {
   fetchPitcherHandednessByIds,
   fetchMlbScheduleByDate,
   fetchPitcherErasByIds,
-  fetchPitcherStrikeoutsPerGameByIds
+  fetchPitcherStrikeoutsPerGameByIds,
+  getTeamAbbreviation
 } from "./api/mlbApi";
 import DateFilter from "./components/DateFilter";
 import GamesList from "./components/GamesList";
@@ -36,6 +37,34 @@ function hasGameStarted(game) {
   return Date.now() >= startTime;
 }
 
+function isGameLive(game) {
+  const detailedState = `${game?.status?.detailedState ?? ""}`.toLowerCase();
+  const abstractState = `${game?.status?.abstractGameState ?? ""}`.toLowerCase();
+  return (
+    abstractState === "live" ||
+    detailedState.includes("in progress") ||
+    detailedState.includes("warmup")
+  );
+}
+
+function getMatchTagLabel(game) {
+  const awayTeam = game?.teams?.away?.team;
+  const homeTeam = game?.teams?.home?.team;
+  const away = getTeamAbbreviation(awayTeam);
+  const home = getTeamAbbreviation(homeTeam);
+  return `${away} vs ${home}`;
+}
+
+function getMatchPriority(game) {
+  if (isGameLive(game)) {
+    return 0;
+  }
+  if (!hasGameStarted(game)) {
+    return 1;
+  }
+  return 2;
+}
+
 export default function App() {
   const todayDate = useMemo(() => getTodayIsoDate(), []);
   const minSelectableDate = useMemo(() => addDays(todayDate, -3), [todayDate]);
@@ -48,6 +77,7 @@ export default function App() {
   const [pitcherHandednessById, setPitcherHandednessById] = useState({});
   const [oddsLoading, setOddsLoading] = useState(false);
   const [gamesViewMode, setGamesViewMode] = useState("all");
+  const [selectedMatchFilter, setSelectedMatchFilter] = useState("all");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -109,12 +139,37 @@ export default function App() {
     return `Mostrando juegos para ${selectedDate}`;
   }, [selectedDate]);
 
+  const matchFilterOptions = useMemo(() => {
+    return [...games]
+      .sort((a, b) => {
+        const rankDiff = getMatchPriority(a) - getMatchPriority(b);
+        if (rankDiff !== 0) {
+          return rankDiff;
+        }
+        const timeA = new Date(a?.gameDate ?? "").getTime() || 0;
+        const timeB = new Date(b?.gameDate ?? "").getTime() || 0;
+        return timeA - timeB;
+      })
+      .map((game) => ({
+        id: String(game?.gamePk),
+        label: getMatchTagLabel(game),
+        isLive: isGameLive(game),
+        isUpcoming: !hasGameStarted(game)
+      }));
+  }, [games]);
+
   const visibleGames = useMemo(() => {
-    if (gamesViewMode === "all") {
-      return games;
+    let filteredGames = games;
+    if (gamesViewMode === "upcoming") {
+      filteredGames = filteredGames.filter((game) => !hasGameStarted(game));
     }
-    return games.filter((game) => !hasGameStarted(game));
-  }, [games, gamesViewMode]);
+    if (selectedMatchFilter !== "all") {
+      filteredGames = filteredGames.filter((game) => {
+        return String(game?.gamePk) === selectedMatchFilter;
+      });
+    }
+    return filteredGames;
+  }, [games, gamesViewMode, selectedMatchFilter]);
 
   function handleDateChange(nextDate) {
     if (!nextDate) {
@@ -171,6 +226,32 @@ export default function App() {
         >
           Todos
         </button>
+      </div>
+      <div className="match-filter-strip" role="tablist" aria-label="Filtro por match">
+        <button
+          type="button"
+          className={`match-filter-tag ${selectedMatchFilter === "all" ? "active" : ""}`}
+          onClick={() => setSelectedMatchFilter("all")}
+        >
+          Todos los matches
+        </button>
+        {matchFilterOptions.map((match) => (
+          <button
+            key={match.id}
+            type="button"
+            className={`match-filter-tag ${selectedMatchFilter === match.id ? "active" : ""}`}
+            onClick={() => setSelectedMatchFilter(match.id)}
+            title={match.isLive ? "En vivo" : match.isUpcoming ? "Proximo" : undefined}
+          >
+            <span
+              className={`match-status-dot ${
+                match.isLive ? "live" : match.isUpcoming ? "upcoming" : ""
+              }`}
+              aria-hidden="true"
+            />
+            {match.label}
+          </button>
+        ))}
       </div>
       {error ? <p className="error">{error}</p> : null}
       {loading ? (

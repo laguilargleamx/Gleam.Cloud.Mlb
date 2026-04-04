@@ -150,6 +150,58 @@ function hasGameStarted(game) {
   return Date.now() >= startTime;
 }
 
+function isGameLive(game) {
+  const detailedState = `${game?.status?.detailedState ?? ""}`.toLowerCase();
+  const abstractState = `${game?.status?.abstractGameState ?? ""}`.toLowerCase();
+  return (
+    abstractState === "live" ||
+    detailedState.includes("in progress") ||
+    detailedState.includes("warmup")
+  );
+}
+
+function getLiveInningLabel(game) {
+  const inningOrdinal = game?.linescore?.currentInningOrdinal;
+  const inningState = game?.linescore?.inningState || game?.linescore?.inningHalf;
+  if (!inningOrdinal || !inningState) {
+    return null;
+  }
+  const stateText = `${inningState}`.toLowerCase();
+  if (stateText.includes("top")) {
+    return `Top ${inningOrdinal}`;
+  }
+  if (stateText.includes("bottom")) {
+    return `Bot ${inningOrdinal}`;
+  }
+  return `${inningState} ${inningOrdinal}`;
+}
+
+function LiveSituationIndicator({ linescore, large = false }) {
+  const offense = linescore?.offense ?? {};
+  const onFirst = Boolean(offense?.first);
+  const onSecond = Boolean(offense?.second);
+  const onThird = Boolean(offense?.third);
+  const outs = Number(linescore?.outs ?? 0);
+
+  return (
+    <div
+      className={`live-situation ${large ? "large" : ""}`}
+      aria-label="Situacion en bases y outs"
+    >
+      <div className="base-diamond">
+        <span className={`base-dot base-second ${onSecond ? "occupied" : ""}`} />
+        <span className={`base-dot base-first ${onFirst ? "occupied" : ""}`} />
+        <span className={`base-dot base-third ${onThird ? "occupied" : ""}`} />
+      </div>
+      <div className="outs-dots" aria-label={`${outs} outs`}>
+        <span className={`out-dot ${outs >= 1 ? "active" : ""}`} />
+        <span className={`out-dot ${outs >= 2 ? "active" : ""}`} />
+        <span className={`out-dot ${outs >= 3 ? "active" : ""}`} />
+      </div>
+    </div>
+  );
+}
+
 function PitcherBlock({
   team,
   side,
@@ -452,6 +504,10 @@ export default function GameCard({
   const homePitcherId = game.teams.home.probablePitcher?.id;
   const season = game.season ?? game.officialDate?.split("-")[0];
   const gameStarted = hasGameStarted(game);
+  const liveInningLabel = isGameLive(game) ? getLiveInningLabel(game) : null;
+  const statusLabel = liveInningLabel
+    ? `${game.status.detailedState} - ${liveInningLabel}`
+    : game.status.detailedState;
   const effectiveOddsLoading = oddsLoading || oddsRefreshLoading;
 
   async function handleToggleLineup() {
@@ -602,12 +658,17 @@ export default function GameCard({
     <article className="game-card">
       <div className="game-meta">
         <strong>{localTime}</strong>
-        <span>{game.status.detailedState}</span>
+        <span>{statusLabel}</span>
       </div>
 
       <div className="scoreboard">
         <TeamRow side={game.teams.away} onTeamClick={handleTeamHistoryOpen} />
         <TeamRow side={game.teams.home} onTeamClick={handleTeamHistoryOpen} />
+        {isGameLive(game) ? (
+          <div className="scoreboard-live-overlay">
+            <LiveSituationIndicator linescore={game.linescore} large />
+          </div>
+        ) : null}
       </div>
 
       <p className="venue-line">{game.venue.name}</p>

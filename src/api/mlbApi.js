@@ -53,7 +53,7 @@ const TEAM_ABBR_BY_ID = {
 export async function fetchMlbScheduleByDate(date) {
   const url = new URL(BASE_URL);
   url.searchParams.set("sportId", "1");
-  url.searchParams.set("hydrate", "probablePitcher");
+  url.searchParams.set("hydrate", "probablePitcher,linescore");
   url.searchParams.set("startDate", date);
   url.searchParams.set("endDate", date);
 
