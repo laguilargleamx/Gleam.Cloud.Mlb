@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   fetchPitcherStrikeoutLinesForGame,
   fetchPitcherStrikeoutLinesByGames,
+  fetchPitcherHandednessByIds,
   fetchMlbScheduleByDate,
   fetchPitcherErasByIds,
   fetchPitcherStrikeoutsPerGameByIds
@@ -28,16 +29,11 @@ function addDays(isoDate, daysToAdd) {
 }
 
 function hasGameStarted(game) {
-  const abstractState = `${game?.status?.abstractGameState ?? ""}`.toLowerCase();
-  const detailedState = `${game?.status?.detailedState ?? ""}`.toLowerCase();
-  if (abstractState === "live" || abstractState === "final") {
-    return true;
+  const startTime = new Date(game?.gameDate ?? "").getTime();
+  if (!startTime || Number.isNaN(startTime)) {
+    return false;
   }
-  return (
-    detailedState.includes("in progress") ||
-    detailedState.includes("warmup") ||
-    detailedState.includes("final")
-  );
+  return Date.now() >= startTime;
 }
 
 export default function App() {
@@ -49,6 +45,7 @@ export default function App() {
   const [pitcherErasById, setPitcherErasById] = useState({});
   const [pitcherStrikeoutsPerGameById, setPitcherStrikeoutsPerGameById] = useState({});
   const [pitcherStrikeoutLinesById, setPitcherStrikeoutLinesById] = useState({});
+  const [pitcherHandednessById, setPitcherHandednessById] = useState({});
   const [oddsLoading, setOddsLoading] = useState(false);
   const [gamesViewMode, setGamesViewMode] = useState("all");
   const [loading, setLoading] = useState(false);
@@ -70,10 +67,11 @@ export default function App() {
           game.teams?.home?.probablePitcher?.id
         ]);
         const season = selectedDate.split("-")[0];
-        const [erasMap, strikeoutsPerGameMap, strikeoutLinesMap] = await Promise.all([
+        const [erasMap, strikeoutsPerGameMap, strikeoutLinesMap, handednessMap] = await Promise.all([
           fetchPitcherErasByIds(pitcherIds, season),
           fetchPitcherStrikeoutsPerGameByIds(pitcherIds, season),
-          fetchPitcherStrikeoutLinesByGames(fetchedGames)
+          fetchPitcherStrikeoutLinesByGames(fetchedGames),
+          fetchPitcherHandednessByIds(pitcherIds)
         ]);
 
         if (!ignore) {
@@ -81,6 +79,7 @@ export default function App() {
           setPitcherErasById(erasMap);
           setPitcherStrikeoutsPerGameById(strikeoutsPerGameMap);
           setPitcherStrikeoutLinesById(strikeoutLinesMap);
+          setPitcherHandednessById(handednessMap);
           setOddsLoading(false);
         }
       } catch (err) {
@@ -90,6 +89,7 @@ export default function App() {
           setPitcherErasById({});
           setPitcherStrikeoutsPerGameById({});
           setPitcherStrikeoutLinesById({});
+          setPitcherHandednessById({});
           setOddsLoading(false);
         }
       } finally {
@@ -181,6 +181,7 @@ export default function App() {
           pitcherErasById={pitcherErasById}
           pitcherStrikeoutsPerGameById={pitcherStrikeoutsPerGameById}
           pitcherStrikeoutLinesById={pitcherStrikeoutLinesById}
+          pitcherHandednessById={pitcherHandednessById}
           oddsLoading={oddsLoading}
           onRefreshOddsForGame={handleRefreshOddsForGame}
         />

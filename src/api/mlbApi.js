@@ -9,6 +9,9 @@ const THE_ODDS_API_KEY = (import.meta.env.VITE_THE_ODDS_API_KEY || "").trim();
 const pitcherSeasonStatsCache = new Map();
 const pitcherGameLogsCache = new Map();
 const gameFinalStatusCache = new Map();
+const gameBoxscoreCache = new Map();
+const teamStrikeoutsByGameCache = new Map();
+const pitcherHandednessCache = new Map();
 const lineupCache = new Map();
 const playerHittingStatsCache = new Map();
 const playerHittingStreakCache = new Map();
@@ -182,16 +185,11 @@ function findMatchingEvent(game, events) {
 }
 
 function hasGameStarted(game) {
-  const abstractState = `${game?.status?.abstractGameState ?? ""}`.toLowerCase();
-  const detailedState = `${game?.status?.detailedState ?? ""}`.toLowerCase();
-  if (abstractState === "live" || abstractState === "final") {
-    return true;
+  const startTime = new Date(game?.gameDate ?? "").getTime();
+  if (!startTime || Number.isNaN(startTime)) {
+    return false;
   }
-  return (
-    detailedState.includes("in progress") ||
-    detailedState.includes("warmup") ||
-    detailedState.includes("final")
-  );
+  return Date.now() >= startTime;
 }
 
 async function fetchOddsServiceJson(url) {
@@ -374,6 +372,18 @@ export async function fetchPitcherStrikeoutLinesForGame(
   }
 }
 
+export async function fetchPitcherHandednessByIds(playerIds) {
+  const uniqueIds = [...new Set(playerIds.filter(Boolean))];
+  const results = await Promise.all(
+    uniqueIds.map(async (pitcherId) => {
+      const handedness = await fetchPitcherHandedness(pitcherId);
+      return [pitcherId, handedness];
+    })
+  );
+
+  return Object.fromEntries(results);
+}
+
 async function fetchPitcherSeasonStats(playerId, season) {
   if (!playerId) {
     return null;
@@ -518,6 +528,9 @@ export async function fetchPitcherGameLogs(playerId, season) {
     const normalizedLogs = (
       await Promise.all(
         splits.map(async (split) => {
+          if (split?.gameType && split.gameType !== "R") {
+            return null;
+          }
           const gamePk = split?.game?.gamePk;
           const isGameFinal = await fetchIsGameFinal(gamePk);
           if (!isGameFinal) {
@@ -526,6 +539,8 @@ export async function fetchPitcherGameLogs(playerId, season) {
 
           return {
             gameDate: split?.date ?? "",
+            gamePk: split?.game?.gamePk ?? null,
+            opponentId: split?.opponent?.id ?? null,
             opponentName: split?.opponent?.name ?? "Rival no disponible",
             inningsPitched: split?.stat?.inningsPitched ?? "-",
             strikeOuts: split?.stat?.strikeOuts ?? "-"
@@ -544,6 +559,185 @@ export async function fetchPitcherGameLogs(playerId, season) {
     return normalizedLogs;
   } catch (error) {
     pitcherGameLogsCache.set(cacheKey, []);
+    return [];
+  }
+}
+
+async function fetchGameBoxscore(gamePk) {
+  if (!gamePk) {
+    return null;
+  }
+
+  const cached = gameBoxscoreCache.get(gamePk);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  try {
+    const response = await fetch(`${GAME_FEED_BASE_URL}/${gamePk}/feed/live`);
+    if (!response.ok) {
+      gameBoxscoreCache.set(gamePk, null);
+      return null;
+    }
+    const payload = await response.json();
+    const boxscore = payload?.liveData?.boxscore ?? null;
+    gameBoxscoreCache.set(gamePk, boxscore);
+    return boxscore;
+  } catch (error) {
+    gameBoxscoreCache.set(gamePk, null);
+    return null;
+  }
+}
+
+function extractOpposingStarter(boxscore, sideKey) {
+  const side = boxscore?.teams?.[sideKey];
+  const pitcherIds = side?.pitchers ?? [];
+  const players = side?.players ?? {};
+
+  const pitchers = pitcherIds
+    .map((pitcherId) => players[`ID${pitcherId}`])
+    .filter(Boolean)
+    .map((player) => ({
+      id: player?.person?.id ?? null,
+      name: player?.person?.fullName ?? "Pitcher no disponible",
+      strikeOuts: player?.stats?.pitching?.strikeOuts ?? "-",
+      inningsPitched: player?.stats?.pitching?.inningsPitched ?? "-",
+      numberOfPitches: player?.stats?.pitching?.numberOfPitches ?? "-",
+      gamesStarted: Number(player?.stats?.pitching?.gamesStarted ?? 0)
+    }));
+
+  if (!pitchers.length) {
+    return {
+      opposingStarterId: null,
+      opposingStarter: "No disponible",
+      opposingStarterStrikeOuts: "-",
+      opposingStarterInningsPitched: "-",
+      opposingStarterNumberOfPitches: "-"
+    };
+  }
+
+  const starter = pitchers.find((pitcher) => pitcher.gamesStarted > 0) ?? pitchers[0];
+  return {
+    opposingStarterId: starter?.id ?? null,
+    opposingStarter: starter?.name ?? "Pitcher no disponible",
+    opposingStarterStrikeOuts: starter?.strikeOuts ?? "-",
+    opposingStarterInningsPitched: starter?.inningsPitched ?? "-",
+    opposingStarterNumberOfPitches: starter?.numberOfPitches ?? "-"
+  };
+}
+
+async function fetchPitcherHandedness(playerId) {
+  if (!playerId) {
+    return "-";
+  }
+
+  const cached = pitcherHandednessCache.get(playerId);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const url = `${PEOPLE_BASE_URL}/${playerId}`;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      pitcherHandednessCache.set(playerId, "-");
+      return "-";
+    }
+    const payload = await response.json();
+    const handCode = payload?.people?.[0]?.pitchHand?.code ?? "";
+    const normalized =
+      handCode === "R" ? "Derecho" : handCode === "L" ? "Zurdo" : handCode || "-";
+    pitcherHandednessCache.set(playerId, normalized);
+    return normalized;
+  } catch (error) {
+    pitcherHandednessCache.set(playerId, "-");
+    return "-";
+  }
+}
+
+export async function fetchTeamStrikeoutsByGame(teamId, season) {
+  if (!teamId || !season) {
+    return [];
+  }
+
+  const cacheKey = `${teamId}-${season}`;
+  const cached = teamStrikeoutsByGameCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const startDate = `${season}-01-01`;
+  const endDate = `${season}-12-31`;
+  const scheduleUrl = new URL(BASE_URL);
+  scheduleUrl.searchParams.set("sportId", "1");
+  scheduleUrl.searchParams.set("teamId", String(teamId));
+  scheduleUrl.searchParams.set("startDate", startDate);
+  scheduleUrl.searchParams.set("endDate", endDate);
+
+  try {
+    const response = await fetch(scheduleUrl.toString());
+    if (!response.ok) {
+      teamStrikeoutsByGameCache.set(cacheKey, []);
+      return [];
+    }
+
+    const payload = await response.json();
+    const games = (payload?.dates ?? []).flatMap((dateNode) => dateNode?.games ?? []);
+
+    const rows = (
+      await Promise.all(
+        games.map(async (game) => {
+          const gamePk = game?.gamePk;
+          const isRegularSeason = game?.gameType === "R";
+          if (!isRegularSeason) {
+            return null;
+          }
+          const isFinal = await fetchIsGameFinal(gamePk);
+          if (!isFinal) {
+            return null;
+          }
+
+          const isAway = game?.teams?.away?.team?.id === teamId;
+          const teamNode = isAway ? game?.teams?.away?.team : game?.teams?.home?.team;
+          const opponentNode = isAway ? game?.teams?.home?.team : game?.teams?.away?.team;
+          const teamKey = isAway ? "away" : "home";
+          const opponentKey = isAway ? "home" : "away";
+
+          const boxscore = await fetchGameBoxscore(gamePk);
+          if (!boxscore) {
+            return null;
+          }
+
+          const starterInfo = extractOpposingStarter(boxscore, opponentKey);
+          const opposingStarterHandedness = await fetchPitcherHandedness(
+            starterInfo.opposingStarterId
+          );
+
+          return {
+            gameDate: game?.officialDate ?? "",
+            opponentName: opponentNode?.name ?? "Rival no disponible",
+            teamName: teamNode?.name ?? "Equipo",
+            opposingStarterId: starterInfo.opposingStarterId,
+            opposingStarter: starterInfo.opposingStarter,
+            opposingStarterStrikeOuts: starterInfo.opposingStarterStrikeOuts,
+            opposingStarterInningsPitched: starterInfo.opposingStarterInningsPitched,
+            opposingStarterNumberOfPitches: starterInfo.opposingStarterNumberOfPitches,
+            opposingStarterHandedness
+          };
+        })
+      )
+    )
+      .filter(Boolean)
+      .sort((a, b) => {
+        const timeA = a.gameDate ? new Date(a.gameDate).getTime() : 0;
+        const timeB = b.gameDate ? new Date(b.gameDate).getTime() : 0;
+        return timeB - timeA;
+      });
+
+    teamStrikeoutsByGameCache.set(cacheKey, rows);
+    return rows;
+  } catch (error) {
+    teamStrikeoutsByGameCache.set(cacheKey, []);
     return [];
   }
 }

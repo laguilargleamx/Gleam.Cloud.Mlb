@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   fetchGameLineups,
   fetchPitcherGameLogs,
+  fetchTeamStrikeoutsByGame,
   fetchPlayersHittingStatsByIds,
   fetchPlayersHittingStreaksByIds,
   getPitcherImageUrl,
@@ -30,19 +31,84 @@ function TeamLogo({ team }) {
   );
 }
 
-function TeamRow({ side }) {
+function TeamRow({ side, onTeamClick }) {
   return (
     <div className="score-row">
       <div className="team-left">
         <TeamLogo team={side.team} />
         <div className="team-copy">
-          <strong>{side.team.name}</strong>
+          <button type="button" className="team-name-link" onClick={() => onTeamClick(side.team)}>
+            {side.team.name}
+          </button>
           <span>
             {side.leagueRecord.wins}-{side.leagueRecord.losses}
           </span>
         </div>
       </div>
       <strong className="team-score">{side.score ?? "-"}</strong>
+    </div>
+  );
+}
+
+function TeamHistoryModal({ teamName, season, logs, loading, error, totalStarterStrikeouts, onClose }) {
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal-content"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Historial de ${teamName}`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="modal-header">
+          <h3>{teamName}</h3>
+          <button type="button" className="modal-close" onClick={onClose} aria-label="Cerrar">
+            x
+          </button>
+        </div>
+        <p className="modal-subtitle">Temporada {season} (regular) - Rendimiento vs starter rival</p>
+        {loading ? <p>Cargando historial del equipo...</p> : null}
+        {error ? <p className="error">{error}</p> : null}
+        {!loading && !error ? (
+          logs.length ? (
+            <>
+              <p className="team-history-total">
+                Total SO al starter en este historial: <strong>{totalStarterStrikeouts}</strong>
+              </p>
+              <div className="modal-table-wrap">
+                <table className="modal-table">
+                  <thead>
+                    <tr>
+                      <th>Fecha</th>
+                      <th>Vs</th>
+                      <th>Starter rival</th>
+                      <th>Mano</th>
+                      <th>SO starter</th>
+                      <th>IP starter</th>
+                      <th>Picheos starter</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {logs.map((log) => (
+                      <tr key={`${teamName}-${log.gameDate}-${log.opponentName}`}>
+                        <td>{formatGameLogDate(log.gameDate)}</td>
+                        <td>{log.opponentName}</td>
+                        <td>{log.opposingStarter}</td>
+                        <td>{log.opposingStarterHandedness}</td>
+                        <td>{log.opposingStarterStrikeOuts}</td>
+                        <td>{log.opposingStarterInningsPitched}</td>
+                        <td>{log.opposingStarterNumberOfPitches}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+            <p>No hay juegos finalizados de temporada regular para este equipo.</p>
+          )
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -62,17 +128,26 @@ function formatSoPerGame(strikeoutsPerGame) {
   return numeric.toFixed(1);
 }
 
-function hasGameStarted(game) {
-  const abstractState = `${game?.status?.abstractGameState ?? ""}`.toLowerCase();
-  const detailedState = `${game?.status?.detailedState ?? ""}`.toLowerCase();
-  if (abstractState === "live" || abstractState === "final") {
-    return true;
+function formatHandednessLabel(handedness) {
+  if (!handedness || handedness === "-") {
+    return "";
   }
-  return (
-    detailedState.includes("in progress") ||
-    detailedState.includes("warmup") ||
-    detailedState.includes("final")
-  );
+  const normalized = `${handedness}`.toLowerCase();
+  if (normalized.startsWith("zur")) {
+    return "ZD";
+  }
+  if (normalized.startsWith("der")) {
+    return "DR";
+  }
+  return `${handedness}`.slice(0, 2).toUpperCase();
+}
+
+function hasGameStarted(game) {
+  const startTime = new Date(game?.gameDate ?? "").getTime();
+  if (!startTime || Number.isNaN(startTime)) {
+    return false;
+  }
+  return Date.now() >= startTime;
 }
 
 function PitcherBlock({
@@ -81,6 +156,7 @@ function PitcherBlock({
   era,
   strikeoutsPerGame,
   strikeoutLine,
+  handedness,
   gameStarted,
   oddsLoading,
   onOpenDetails
@@ -90,6 +166,7 @@ function PitcherBlock({
   const code = getTeamAbbreviation(team);
   const eraLabel = era ?? "--";
   const soPerGameLabel = formatSoPerGame(strikeoutsPerGame);
+  const handednessLabel = formatHandednessLabel(handedness);
   const hasPitcher = Boolean(pitcher?.id);
 
   return (
@@ -118,6 +195,7 @@ function PitcherBlock({
         <strong>
           {pitcher?.fullName ?? "Sin pitcher probable"}
           {soPerGameLabel ? ` ${soPerGameLabel} SO/J` : ""}
+          {handednessLabel ? ` (${handednessLabel})` : ""}
         </strong>
         <small>ERA {eraLabel}</small>
         {gameStarted ? (
@@ -159,6 +237,30 @@ function PitcherGameLogModal({
   error,
   onClose
 }) {
+  const [opponentTeamLogs, setOpponentTeamLogs] = useState([]);
+  const [opponentTeamLoading, setOpponentTeamLoading] = useState(false);
+  const [opponentTeamError, setOpponentTeamError] = useState("");
+  const [selectedOpponentName, setSelectedOpponentName] = useState("");
+
+  async function handleOpponentClick(log) {
+    if (!log?.opponentId) {
+      return;
+    }
+
+    setSelectedOpponentName(log.opponentName ?? "Equipo");
+    setOpponentTeamLoading(true);
+    setOpponentTeamError("");
+    try {
+      const logs = await fetchTeamStrikeoutsByGame(log.opponentId, season);
+      setOpponentTeamLogs(logs);
+    } catch (fetchError) {
+      setOpponentTeamLogs([]);
+      setOpponentTeamError("No se pudo cargar el historial de SO del equipo.");
+    } finally {
+      setOpponentTeamLoading(false);
+    }
+  }
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div
@@ -174,7 +276,7 @@ function PitcherGameLogModal({
             x
           </button>
         </div>
-        <p className="modal-subtitle">Temporada {season} - Game log de pitcheo</p>
+        <p className="modal-subtitle">Temporada {season} (regular) - Game log de pitcheo</p>
         {loading ? <p>Cargando juegos...</p> : null}
         {error ? <p className="error">{error}</p> : null}
         {!loading && !error ? (
@@ -191,9 +293,21 @@ function PitcherGameLogModal({
                 </thead>
                 <tbody>
                   {gameLogs.map((log) => (
-                    <tr key={`${log.gameDate}-${log.opponentName}`}>
+                    <tr key={`${log.gamePk ?? log.gameDate}-${log.opponentName}`}>
                       <td>{formatGameLogDate(log.gameDate)}</td>
-                      <td>{log.opponentName}</td>
+                      <td>
+                        {log.opponentId ? (
+                          <button
+                            type="button"
+                            className="opponent-link-button"
+                            onClick={() => handleOpponentClick(log)}
+                          >
+                            {log.opponentName}
+                          </button>
+                        ) : (
+                          log.opponentName
+                        )}
+                      </td>
                       <td>{log.inningsPitched}</td>
                       <td>{log.strikeOuts}</td>
                     </tr>
@@ -204,6 +318,45 @@ function PitcherGameLogModal({
           ) : (
             <p>No hay juegos de temporada para mostrar.</p>
           )
+        ) : null}
+        {selectedOpponentName ? (
+          <section className="opponent-team-section">
+            <h4>{selectedOpponentName} - Historial temporada regular</h4>
+            {opponentTeamLoading ? <p>Cargando historial del equipo...</p> : null}
+            {opponentTeamError ? <p className="error">{opponentTeamError}</p> : null}
+            {!opponentTeamLoading && !opponentTeamError ? (
+              opponentTeamLogs.length ? (
+                <div className="modal-table-wrap">
+                  <table className="modal-table">
+                    <thead>
+                      <tr>
+                        <th>Fecha</th>
+                        <th>Vs</th>
+                        <th>Starter rival</th>
+                        <th>SO starter</th>
+                        <th>IP starter</th>
+                        <th>Picheos starter</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {opponentTeamLogs.map((teamLog) => (
+                        <tr key={`${selectedOpponentName}-${teamLog.gameDate}-${teamLog.opponentName}`}>
+                          <td>{formatGameLogDate(teamLog.gameDate)}</td>
+                          <td>{teamLog.opponentName}</td>
+                          <td>{teamLog.opposingStarter}</td>
+                          <td>{teamLog.opposingStarterStrikeOuts}</td>
+                          <td>{teamLog.opposingStarterInningsPitched}</td>
+                          <td>{teamLog.opposingStarterNumberOfPitches}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p>No hay juegos finalizados para este equipo.</p>
+              )
+            ) : null}
+          </section>
         ) : null}
       </div>
     </div>
@@ -261,6 +414,7 @@ export default function GameCard({
   pitcherErasById,
   pitcherStrikeoutsPerGameById,
   pitcherStrikeoutLinesById,
+  pitcherHandednessById,
   oddsLoading,
   onRefreshOddsForGame
 }) {
@@ -277,6 +431,14 @@ export default function GameCard({
     open: false,
     pitcherName: "",
     gameLogs: [],
+    loading: false,
+    error: ""
+  });
+  const [teamHistoryModal, setTeamHistoryModal] = useState({
+    open: false,
+    teamName: "",
+    logs: [],
+    totalStarterStrikeouts: 0,
     loading: false,
     error: ""
   });
@@ -364,6 +526,48 @@ export default function GameCard({
     }
   }
 
+  async function handleTeamHistoryOpen(team) {
+    const teamId = team?.id;
+    const teamName = team?.name ?? "Equipo";
+    if (!teamId || !season) {
+      return;
+    }
+
+    setTeamHistoryModal({
+      open: true,
+      teamName,
+      logs: [],
+      totalStarterStrikeouts: 0,
+      loading: true,
+      error: ""
+    });
+
+    try {
+      const logs = await fetchTeamStrikeoutsByGame(teamId, season);
+      const totalStarterStrikeouts = logs.reduce(
+        (acc, log) => acc + (Number(log.opposingStarterStrikeOuts) || 0),
+        0
+      );
+      setTeamHistoryModal({
+        open: true,
+        teamName,
+        logs,
+        totalStarterStrikeouts,
+        loading: false,
+        error: ""
+      });
+    } catch (fetchError) {
+      setTeamHistoryModal({
+        open: true,
+        teamName,
+        logs: [],
+        totalStarterStrikeouts: 0,
+        loading: false,
+        error: "No se pudo cargar el historial del equipo."
+      });
+    }
+  }
+
   function handlePitcherDetailsClose() {
     setPitcherModal((current) => ({ ...current, open: false }));
   }
@@ -402,8 +606,8 @@ export default function GameCard({
       </div>
 
       <div className="scoreboard">
-        <TeamRow side={game.teams.away} />
-        <TeamRow side={game.teams.home} />
+        <TeamRow side={game.teams.away} onTeamClick={handleTeamHistoryOpen} />
+        <TeamRow side={game.teams.home} onTeamClick={handleTeamHistoryOpen} />
       </div>
 
       <p className="venue-line">{game.venue.name}</p>
@@ -415,6 +619,7 @@ export default function GameCard({
           era={pitcherErasById?.[awayPitcherId]}
           strikeoutsPerGame={pitcherStrikeoutsPerGameById?.[awayPitcherId]}
           strikeoutLine={pitcherStrikeoutLinesById?.[awayPitcherId]}
+          handedness={pitcherHandednessById?.[awayPitcherId]}
           gameStarted={gameStarted}
           oddsLoading={effectiveOddsLoading}
           onOpenDetails={() => handlePitcherDetailsOpen(game.teams.away)}
@@ -425,6 +630,7 @@ export default function GameCard({
           era={pitcherErasById?.[homePitcherId]}
           strikeoutsPerGame={pitcherStrikeoutsPerGameById?.[homePitcherId]}
           strikeoutLine={pitcherStrikeoutLinesById?.[homePitcherId]}
+          handedness={pitcherHandednessById?.[homePitcherId]}
           gameStarted={gameStarted}
           oddsLoading={effectiveOddsLoading}
           onOpenDetails={() => handlePitcherDetailsOpen(game.teams.home)}
@@ -544,6 +750,17 @@ export default function GameCard({
           loading={pitcherModal.loading}
           error={pitcherModal.error}
           onClose={handlePitcherDetailsClose}
+        />
+      ) : null}
+      {teamHistoryModal.open ? (
+        <TeamHistoryModal
+          teamName={teamHistoryModal.teamName}
+          season={season}
+          logs={teamHistoryModal.logs}
+          totalStarterStrikeouts={teamHistoryModal.totalStarterStrikeouts}
+          loading={teamHistoryModal.loading}
+          error={teamHistoryModal.error}
+          onClose={() => setTeamHistoryModal((current) => ({ ...current, open: false }))}
         />
       ) : null}
     </article>
