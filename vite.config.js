@@ -5,6 +5,11 @@ import { VitePWA } from "vite-plugin-pwa";
 export default defineConfig({
   server: {
     proxy: {
+      "/backend-api": {
+        target: "http://127.0.0.1:8000",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/backend-api/, "")
+      },
       "/odds-api": {
         target: "https://api.the-odds-api.com",
         changeOrigin: true,

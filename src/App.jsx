@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  evaluatePitcherStrikeoutValueByGames,
   fetchPitcherStrikeoutLinesForGame,
   fetchPitcherStrikeoutLinesByGames,
   fetchPitcherHandednessByIds,
@@ -74,6 +75,7 @@ export default function App() {
   const [pitcherErasById, setPitcherErasById] = useState({});
   const [pitcherStrikeoutsPerGameById, setPitcherStrikeoutsPerGameById] = useState({});
   const [pitcherStrikeoutLinesById, setPitcherStrikeoutLinesById] = useState({});
+  const [pitcherStrikeoutValueById, setPitcherStrikeoutValueById] = useState({});
   const [pitcherHandednessById, setPitcherHandednessById] = useState({});
   const [oddsLoading, setOddsLoading] = useState(false);
   const [gamesViewMode, setGamesViewMode] = useState("all");
@@ -97,18 +99,25 @@ export default function App() {
           game.teams?.home?.probablePitcher?.id
         ]);
         const season = selectedDate.split("-")[0];
-        const [erasMap, strikeoutsPerGameMap, strikeoutLinesMap, handednessMap] = await Promise.all([
-          fetchPitcherErasByIds(pitcherIds, season),
-          fetchPitcherStrikeoutsPerGameByIds(pitcherIds, season),
-          fetchPitcherStrikeoutLinesByGames(fetchedGames),
-          fetchPitcherHandednessByIds(pitcherIds)
-        ]);
+        const [erasMap, strikeoutsPerGameMap, strikeoutLinesMap, handednessMap] =
+          await Promise.all([
+            fetchPitcherErasByIds(pitcherIds, season),
+            fetchPitcherStrikeoutsPerGameByIds(pitcherIds, season),
+            fetchPitcherStrikeoutLinesByGames(fetchedGames),
+            fetchPitcherHandednessByIds(pitcherIds)
+          ]);
+        const strikeoutValueMap = await evaluatePitcherStrikeoutValueByGames(
+          fetchedGames,
+          strikeoutLinesMap,
+          { season, pitcherHandednessById: handednessMap }
+        );
 
         if (!ignore) {
           setGames(fetchedGames);
           setPitcherErasById(erasMap);
           setPitcherStrikeoutsPerGameById(strikeoutsPerGameMap);
           setPitcherStrikeoutLinesById(strikeoutLinesMap);
+          setPitcherStrikeoutValueById(strikeoutValueMap);
           setPitcherHandednessById(handednessMap);
           setOddsLoading(false);
         }
@@ -119,6 +128,7 @@ export default function App() {
           setPitcherErasById({});
           setPitcherStrikeoutsPerGameById({});
           setPitcherStrikeoutLinesById({});
+          setPitcherStrikeoutValueById({});
           setPitcherHandednessById({});
           setOddsLoading(false);
         }
@@ -185,8 +195,25 @@ export default function App() {
     const result = await fetchPitcherStrikeoutLinesForGame(game, { forceRefresh: true });
     const awayPitcherId = game?.teams?.away?.probablePitcher?.id;
     const homePitcherId = game?.teams?.home?.probablePitcher?.id;
+    const nextLinesByPitcherId = { ...pitcherStrikeoutLinesById };
 
-    setPitcherStrikeoutLinesById((current) => {
+    if (awayPitcherId) {
+      delete nextLinesByPitcherId[awayPitcherId];
+    }
+    if (homePitcherId) {
+      delete nextLinesByPitcherId[homePitcherId];
+    }
+    Object.assign(nextLinesByPitcherId, result.linesByPitcherId);
+
+    const season = selectedDate.split("-")[0];
+    const refreshedValueMap = await evaluatePitcherStrikeoutValueByGames(
+      [game],
+      nextLinesByPitcherId,
+      { season, pitcherHandednessById }
+    );
+
+    setPitcherStrikeoutLinesById(nextLinesByPitcherId);
+    setPitcherStrikeoutValueById((current) => {
       const next = { ...current };
       if (awayPitcherId) {
         delete next[awayPitcherId];
@@ -194,7 +221,7 @@ export default function App() {
       if (homePitcherId) {
         delete next[homePitcherId];
       }
-      return { ...next, ...result.linesByPitcherId };
+      return { ...next, ...refreshedValueMap };
     });
 
     return result.debug;
@@ -262,6 +289,7 @@ export default function App() {
           pitcherErasById={pitcherErasById}
           pitcherStrikeoutsPerGameById={pitcherStrikeoutsPerGameById}
           pitcherStrikeoutLinesById={pitcherStrikeoutLinesById}
+          pitcherStrikeoutValueById={pitcherStrikeoutValueById}
           pitcherHandednessById={pitcherHandednessById}
           oddsLoading={oddsLoading}
           onRefreshOddsForGame={handleRefreshOddsForGame}

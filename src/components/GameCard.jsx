@@ -142,6 +142,113 @@ function formatHandednessLabel(handedness) {
   return `${handedness}`.slice(0, 2).toUpperCase();
 }
 
+function formatPercentFromRatio(ratio) {
+  const numeric = Number(ratio);
+  if (!Number.isFinite(numeric)) {
+    return "--";
+  }
+  return `${(numeric * 100).toFixed(0)}%`;
+}
+
+function formatSignedPercentFromRatio(ratio) {
+  const numeric = Number(ratio);
+  if (!Number.isFinite(numeric)) {
+    return "";
+  }
+  const sign = numeric > 0 ? "+" : "";
+  return `${sign}${(numeric * 100).toFixed(1)}%`;
+}
+
+function formatStrikeoutValueSummary(strikeoutValue) {
+  if (!strikeoutValue) {
+    return "";
+  }
+  if (strikeoutValue?.unavailableReason) {
+    return `Sin evaluacion: ${strikeoutValue.unavailableReason}`;
+  }
+  const projectedK = Number(strikeoutValue?.projectedStrikeouts);
+  const projectedLabel = Number.isFinite(projectedK) ? projectedK.toFixed(1) : "--";
+  const probabilityLabel = formatPercentFromRatio(strikeoutValue?.probabilityOver);
+  const edgeLabel = Number.isFinite(Number(strikeoutValue?.edgeOver))
+    ? ` (${formatSignedPercentFromRatio(strikeoutValue.edgeOver)})`
+    : "";
+
+  return `${strikeoutValue?.valueLabel ?? "Nula"}${edgeLabel} · Proy ${projectedLabel} K · P(Over) ${probabilityLabel}`;
+}
+
+function formatRecommendationNarrative(strikeoutValue) {
+  if (!strikeoutValue) {
+    return "";
+  }
+  if (strikeoutValue?.unavailableReason) {
+    return `No se genera sugerencia: ${strikeoutValue.unavailableReason}.`;
+  }
+
+  const label = `${strikeoutValue?.valueLabel ?? "Nula"}`.toLowerCase();
+  const projected = Number(strikeoutValue?.projectedStrikeouts);
+  const line = Number(strikeoutValue?.offeredLine);
+  const probabilityOver = Number(strikeoutValue?.probabilityOver);
+  const edge = Number(strikeoutValue?.edgeOver);
+  const sampleSize = Number(strikeoutValue?.statsSampleSize) || 0;
+  const opponentSample = Number(strikeoutValue?.opponentSampleSize) || 0;
+  const opponentFactor = Number(strikeoutValue?.opponentFactor);
+  const workloadFactor = Number(strikeoutValue?.workloadFactor);
+
+  const projectedLabel = Number.isFinite(projected) ? projected.toFixed(1) : "--";
+  const lineLabel = Number.isFinite(line) ? line.toFixed(1) : "--";
+  const overLabel = formatPercentFromRatio(probabilityOver);
+  const edgeLabel = Number.isFinite(edge) ? formatSignedPercentFromRatio(edge) : "N/D";
+  const rivalImpact = Number.isFinite(opponentFactor)
+    ? opponentFactor >= 1
+      ? "favorece algo mas de ponches"
+      : "tiende a reducir el techo de ponches"
+    : "no aporta un ajuste claro";
+  const workloadImpact = Number.isFinite(workloadFactor)
+    ? workloadFactor >= 1
+      ? "con carga reciente estable"
+      : "con carga reciente mas limitada"
+    : "con carga reciente no concluyente";
+
+  if (label === "valor") {
+    return `Se sugiere valor en esta linea: la proyeccion es ${projectedLabel} K frente a ${lineLabel} K, con P(Over) ${overLabel} y edge ${edgeLabel}. El rival ${rivalImpact} y el modelo usa ${sampleSize} juegos recientes del pitcher (${opponentSample} del rival), ${workloadImpact}.`;
+  }
+  if (label === "sobrevalorada") {
+    return `Se considera sobrevalorada esta linea: la proyeccion es ${projectedLabel} K frente a ${lineLabel} K, con P(Over) ${overLabel} y edge ${edgeLabel}. El rival ${rivalImpact} y la muestra del modelo incluye ${sampleSize} juegos del pitcher (${opponentSample} del rival), ${workloadImpact}.`;
+  }
+
+  return `Linea considerada nula: la proyeccion (${projectedLabel} K) queda cerca de la oferta (${lineLabel} K), con P(Over) ${overLabel} y edge ${edgeLabel}. Se apoya en ${sampleSize} juegos recientes del pitcher y ${opponentSample} del rival, ${workloadImpact}.`;
+}
+
+function getRecommendationBadge(strikeoutValue) {
+  if (!strikeoutValue || strikeoutValue?.unavailableReason) {
+    return null;
+  }
+
+  const probabilityOver = Number(strikeoutValue?.probabilityOver);
+  const safeProbabilityOver = Number.isFinite(probabilityOver) ? probabilityOver : 0.5;
+  const valueLabel = `${strikeoutValue?.valueLabel ?? "Nula"}`.toLowerCase();
+
+  if (valueLabel === "valor") {
+    return {
+      tone: "over",
+      label: "Over",
+      probability: safeProbabilityOver
+    };
+  }
+  if (valueLabel === "sobrevalorada") {
+    return {
+      tone: "under",
+      label: "Under",
+      probability: 1 - safeProbabilityOver
+    };
+  }
+  return {
+    tone: "nula",
+    label: "Nula",
+    probability: safeProbabilityOver
+  };
+}
+
 function hasGameStarted(game) {
   const startTime = new Date(game?.gameDate ?? "").getTime();
   if (!startTime || Number.isNaN(startTime)) {
@@ -208,6 +315,7 @@ function PitcherBlock({
   era,
   strikeoutsPerGame,
   strikeoutLine,
+  strikeoutValue,
   handedness,
   gameStarted,
   oddsLoading,
@@ -220,15 +328,27 @@ function PitcherBlock({
   const soPerGameLabel = formatSoPerGame(strikeoutsPerGame);
   const handednessLabel = formatHandednessLabel(handedness);
   const hasPitcher = Boolean(pitcher?.id);
+  const lineUpdatedLabel = formatRelativeUpdateTime(strikeoutLine?.updatedAt);
+  const valueSummary = formatStrikeoutValueSummary(strikeoutValue);
+  const recommendationNarrative = formatRecommendationNarrative(strikeoutValue);
+  const recommendationBadge = getRecommendationBadge(strikeoutValue);
 
   return (
     <button
       type="button"
-      className={`pitcher-block ${hasPitcher ? "pitcher-block-clickable" : ""}`}
+      className={`pitcher-block ${hasPitcher ? "pitcher-block-clickable" : ""} ${
+        recommendationBadge ? "has-recommendation-badge" : ""
+      }`}
       onClick={hasPitcher ? onOpenDetails : undefined}
       disabled={!hasPitcher}
       title={hasPitcher ? "Ver juegos del pitcher en temporada" : undefined}
     >
+      {recommendationBadge ? (
+        <div className={`pitcher-recommendation-badge ${recommendationBadge.tone}`}>
+          <strong>{recommendationBadge.label}</strong>
+          <span>{formatPercentFromRatio(recommendationBadge.probability)}</span>
+        </div>
+      ) : null}
       <div className="pitcher-avatar">
         {imageUrl ? (
           <img
@@ -255,9 +375,14 @@ function PitcherBlock({
         ) : oddsLoading ? (
           <small>Cargando odds...</small>
         ) : strikeoutLine?.line !== undefined ? (
-          <small>
-            {strikeoutLine?.sportsbookTitle ?? "Sportsbook"}: {strikeoutLine.line} K
-          </small>
+          <>
+            <small>
+              {strikeoutLine?.sportsbookTitle ?? "Sportsbook"}: {strikeoutLine.line} K
+              {lineUpdatedLabel ? ` · Ultima actualizacion ${lineUpdatedLabel}` : ""}
+            </small>
+            {valueSummary ? <small>{valueSummary}</small> : null}
+            {recommendationNarrative ? <small>{recommendationNarrative}</small> : null}
+          </>
         ) : (
           <small>Sin linea de sportsbook</small>
         )}
@@ -279,6 +404,34 @@ function formatGameLogDate(dateString) {
     month: "2-digit",
     year: "numeric"
   });
+}
+
+function formatRelativeUpdateTime(updatedAt) {
+  const updatedAtTimestamp = Number(updatedAt);
+  if (!updatedAtTimestamp || Number.isNaN(updatedAtTimestamp)) {
+    return "";
+  }
+
+  const elapsedMs = Date.now() - updatedAtTimestamp;
+  if (elapsedMs < 0) {
+    return "justo ahora";
+  }
+
+  const minutes = Math.floor(elapsedMs / (1000 * 60));
+  if (minutes < 1) {
+    return "justo ahora";
+  }
+  if (minutes < 60) {
+    return `hace ${minutes} min`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return hours === 1 ? "hace 1 hora" : `hace ${hours} horas`;
+  }
+
+  const days = Math.floor(hours / 24);
+  return days === 1 ? "hace 1 dia" : `hace ${days} dias`;
 }
 
 function PitcherGameLogModal({
@@ -466,6 +619,7 @@ export default function GameCard({
   pitcherErasById,
   pitcherStrikeoutsPerGameById,
   pitcherStrikeoutLinesById,
+  pitcherStrikeoutValueById,
   pitcherHandednessById,
   oddsLoading,
   onRefreshOddsForGame
@@ -680,6 +834,7 @@ export default function GameCard({
           era={pitcherErasById?.[awayPitcherId]}
           strikeoutsPerGame={pitcherStrikeoutsPerGameById?.[awayPitcherId]}
           strikeoutLine={pitcherStrikeoutLinesById?.[awayPitcherId]}
+          strikeoutValue={pitcherStrikeoutValueById?.[awayPitcherId]}
           handedness={pitcherHandednessById?.[awayPitcherId]}
           gameStarted={gameStarted}
           oddsLoading={effectiveOddsLoading}
@@ -691,6 +846,7 @@ export default function GameCard({
           era={pitcherErasById?.[homePitcherId]}
           strikeoutsPerGame={pitcherStrikeoutsPerGameById?.[homePitcherId]}
           strikeoutLine={pitcherStrikeoutLinesById?.[homePitcherId]}
+          strikeoutValue={pitcherStrikeoutValueById?.[homePitcherId]}
           handedness={pitcherHandednessById?.[homePitcherId]}
           gameStarted={gameStarted}
           oddsLoading={effectiveOddsLoading}

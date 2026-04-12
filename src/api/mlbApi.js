@@ -2,10 +2,14 @@ const BASE_URL = "https://statsapi.mlb.com/api/v1/schedule";
 const ESPN_LOGO_BASE_URL = "https://a.espncdn.com/i/teamlogos/mlb/500";
 const PEOPLE_BASE_URL = "https://statsapi.mlb.com/api/v1/people";
 const GAME_FEED_BASE_URL = "https://statsapi.mlb.com/api/v1.1/game";
-const configuredOddsBaseUrl = (import.meta.env.VITE_THE_ODDS_API_BASE_URL || "/odds-api/v4").trim();
-const THE_ODDS_API_BASE_URL =
-  configuredOddsBaseUrl.includes("api.the-odds-api.com") ? "/odds-api/v4" : configuredOddsBaseUrl;
-const THE_ODDS_API_KEY = (import.meta.env.VITE_THE_ODDS_API_KEY || "").trim();
+const BACKEND_ODDS_API_BASE_URL = (
+  import.meta.env.VITE_BACKEND_API_BASE_URL || "/backend-api"
+).trim();
+const configuredOddsCacheTtlMinutes = Number(import.meta.env.VITE_ODDS_CACHE_TTL_MINUTES);
+const ODDS_CACHE_TTL_MS =
+  Number.isFinite(configuredOddsCacheTtlMinutes) && configuredOddsCacheTtlMinutes > 0
+    ? configuredOddsCacheTtlMinutes * 60 * 1000
+    : 10 * 60 * 1000;
 const pitcherSeasonStatsCache = new Map();
 const pitcherGameLogsCache = new Map();
 const gameFinalStatusCache = new Map();
@@ -152,9 +156,18 @@ function extractPitcherStrikeoutLine(bookmaker, pitcherName) {
   }
 
   const overOutcome = matchingOutcomes.find((outcome) => `${outcome?.name}`.toLowerCase() === "over");
+  const underOutcome = matchingOutcomes.find((outcome) => `${outcome?.name}`.toLowerCase() === "under");
   const firstWithPoint = matchingOutcomes.find((outcome) => typeof outcome?.point === "number");
   const selected = overOutcome ?? firstWithPoint ?? matchingOutcomes[0];
-  return typeof selected?.point === "number" ? selected.point : null;
+  if (typeof selected?.point !== "number") {
+    return null;
+  }
+
+  return {
+    line: selected.point,
+    overPrice: typeof overOutcome?.price === "number" ? overOutcome.price : null,
+    underPrice: typeof underOutcome?.price === "number" ? underOutcome.price : null
+  };
 }
 
 function findMatchingEvent(game, events) {
@@ -192,21 +205,12 @@ function hasGameStarted(game) {
   return Date.now() >= startTime;
 }
 
-async function fetchOddsServiceJson(url) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`The Odds API error ${response.status}`);
-  }
-  return response.json();
-}
-
-function buildOddsApiUrl(pathname) {
-  const base = THE_ODDS_API_BASE_URL.endsWith("/")
-    ? THE_ODDS_API_BASE_URL.slice(0, -1)
-    : THE_ODDS_API_BASE_URL;
+function buildBackendApiUrl(pathname) {
+  const base = BACKEND_ODDS_API_BASE_URL.endsWith("/")
+    ? BACKEND_ODDS_API_BASE_URL.slice(0, -1)
+    : BACKEND_ODDS_API_BASE_URL;
   const path = pathname.startsWith("/") ? pathname : `/${pathname}`;
 
-  // Support relative dev proxy base like "/odds-api/v4".
   if (base.startsWith("/")) {
     const origin =
       typeof window !== "undefined" && window.location?.origin
@@ -218,15 +222,92 @@ function buildOddsApiUrl(pathname) {
   return new URL(`${base}${path}`);
 }
 
+async function fetchBackendOddsJson(pathname, payload) {
+  const url = buildBackendApiUrl(pathname);
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload ?? {})
+  });
+  if (!response.ok) {
+    throw new Error(`Backend odds API error ${response.status}`);
+  }
+  return response.json();
+}
+
+function getCachedOddsLines(cacheKey) {
+  const cached = pitcherStrikeoutLineCache.get(cacheKey);
+  if (cached === undefined) {
+    return null;
+  }
+
+  const cacheAge = Date.now() - Number(cached.fetchedAt || 0);
+  if (cacheAge <= ODDS_CACHE_TTL_MS) {
+    return cached.linesByPitcherId ?? null;
+  }
+
+  pitcherStrikeoutLineCache.delete(cacheKey);
+  return null;
+}
+
+function setCachedOddsLines(cacheKey, linesByPitcherId) {
+  if (!Object.keys(linesByPitcherId || {}).length) {
+    pitcherStrikeoutLineCache.delete(cacheKey);
+    return;
+  }
+
+  pitcherStrikeoutLineCache.set(cacheKey, {
+    linesByPitcherId,
+    fetchedAt: Date.now()
+  });
+}
+
+function invalidateOddsCacheForGame(gamePk) {
+  if (!gamePk) {
+    return;
+  }
+
+  const targetGamePk = String(gamePk);
+  for (const cacheKey of pitcherStrikeoutLineCache.keys()) {
+    const parts = cacheKey.split("-");
+    const gamePkSegment = parts[parts.length - 1] || "";
+    const gamePks = gamePkSegment.split(",").filter(Boolean);
+    if (gamePks.includes(targetGamePk)) {
+      pitcherStrikeoutLineCache.delete(cacheKey);
+    }
+  }
+}
+
+function normalizeBackendLinesMap(linesByPitcherId) {
+  if (!linesByPitcherId || typeof linesByPitcherId !== "object") {
+    return {};
+  }
+
+  return Object.entries(linesByPitcherId).reduce((acc, [pitcherId, node]) => {
+    const normalizedPitcherId = Number(pitcherId);
+    if (!normalizedPitcherId || !node) {
+      return acc;
+    }
+
+    acc[normalizedPitcherId] = {
+      line: typeof node?.line === "number" ? node.line : Number(node?.line),
+      overPrice: node?.overPrice ?? null,
+      underPrice: node?.underPrice ?? null,
+      sportsbookKey: node?.sportsbookKey ?? "sportsbook",
+      sportsbookTitle: node?.sportsbookTitle ?? node?.sportsbookKey ?? "Sportsbook",
+      updatedAt: node?.updatedAt ?? Date.now()
+    };
+    return acc;
+  }, {});
+}
+
 export async function fetchPitcherStrikeoutLinesByGames(
   games,
   { preferredBookmakerKey = "draftkings", regions = "us" } = {}
 ) {
   try {
-    if (!THE_ODDS_API_KEY) {
-      return {};
-    }
-
     if (!Array.isArray(games) || !games.length) {
       return {};
     }
@@ -240,33 +321,20 @@ export async function fetchPitcherStrikeoutLinesByGames(
       .map((game) => game?.gamePk)
       .filter(Boolean)
       .join(",")}`;
-    const cached = pitcherStrikeoutLineCache.get(cacheKey);
-    if (cached !== undefined) {
+    const cached = getCachedOddsLines(cacheKey);
+    if (cached) {
       return cached;
     }
 
-    const eventsUrl = buildOddsApiUrl("/sports/baseball_mlb/events");
-    eventsUrl.searchParams.set("apiKey", THE_ODDS_API_KEY);
-    const events = await fetchOddsServiceJson(eventsUrl.toString());
+    const payload = await fetchBackendOddsJson("/odds/lines/by-games", {
+      games: upcomingGames,
+      preferredBookmakerKey,
+      regions,
+      forceRefresh: false
+    });
+    const linesByPitcherId = normalizeBackendLinesMap(payload?.linesByPitcherId);
 
-    const linesByPitcherId = {};
-    await Promise.all(
-      upcomingGames.map(async (game) => {
-        const result = await fetchPitcherStrikeoutLinesForGame(game, {
-          preferredBookmakerKey,
-          regions,
-          forceRefresh: false,
-          events
-        });
-        Object.assign(linesByPitcherId, result.linesByPitcherId);
-      })
-    );
-
-    if (Object.keys(linesByPitcherId).length) {
-      pitcherStrikeoutLineCache.set(cacheKey, linesByPitcherId);
-    } else {
-      pitcherStrikeoutLineCache.delete(cacheKey);
-    }
+    setCachedOddsLines(cacheKey, linesByPitcherId);
     return linesByPitcherId;
   } catch (error) {
     return {};
@@ -275,21 +343,15 @@ export async function fetchPitcherStrikeoutLinesByGames(
 
 export async function fetchPitcherStrikeoutLinesForGame(
   game,
-  { preferredBookmakerKey = "draftkings", regions = "us", forceRefresh = true, events = null } = {}
+  { preferredBookmakerKey = "draftkings", regions = "us", forceRefresh = true } = {}
 ) {
   const debug = {
-    eventsUrl: "",
-    oddsUrl: "",
-    matchedEventId: "",
+    endpoint: "",
     bookmakerKey: "",
     error: ""
   };
 
   try {
-    if (!THE_ODDS_API_KEY) {
-      debug.error = "Missing API key";
-      return { linesByPitcherId: {}, debug };
-    }
     if (!game) {
       debug.error = "Missing game";
       return { linesByPitcherId: {}, debug };
@@ -301,67 +363,29 @@ export async function fetchPitcherStrikeoutLinesForGame(
 
     const cacheKey = `${preferredBookmakerKey}-${regions}-${game?.gamePk}`;
     if (!forceRefresh) {
-      const cached = pitcherStrikeoutLineCache.get(cacheKey);
-      if (cached !== undefined) {
+      const cached = getCachedOddsLines(cacheKey);
+      if (cached) {
         return { linesByPitcherId: cached, debug };
       }
     } else {
-      pitcherStrikeoutLineCache.delete(cacheKey);
+      invalidateOddsCacheForGame(game?.gamePk);
     }
 
-    const eventsUrl = buildOddsApiUrl("/sports/baseball_mlb/events");
-    eventsUrl.searchParams.set("apiKey", THE_ODDS_API_KEY);
-    debug.eventsUrl = eventsUrl.toString();
-    const allEvents = Array.isArray(events) ? events : await fetchOddsServiceJson(eventsUrl.toString());
-
-    const event = findMatchingEvent(game, allEvents);
-    if (!event?.id) {
-      debug.error = "No matching event";
-      return { linesByPitcherId: {}, debug };
-    }
-    debug.matchedEventId = event.id;
-
-    const oddsUrl = buildOddsApiUrl(`/sports/baseball_mlb/events/${event.id}/odds`);
-    oddsUrl.searchParams.set("apiKey", THE_ODDS_API_KEY);
-    oddsUrl.searchParams.set("regions", regions);
-    oddsUrl.searchParams.set("markets", "pitcher_strikeouts");
-    oddsUrl.searchParams.set("oddsFormat", "american");
-    debug.oddsUrl = oddsUrl.toString();
-
-    const oddsPayload = await fetchOddsServiceJson(oddsUrl.toString());
-    const bookmakers = oddsPayload?.bookmakers ?? oddsPayload?.data?.bookmakers ?? [];
-    const bookmaker = selectBookmaker(bookmakers, preferredBookmakerKey);
-    if (!bookmaker) {
-      debug.error = "No bookmaker";
-      return { linesByPitcherId: {}, debug };
-    }
-    debug.bookmakerKey = bookmaker?.key ?? "";
-
-    const linesByPitcherId = {};
-    const awayPitcher = game?.teams?.away?.probablePitcher;
-    const homePitcher = game?.teams?.home?.probablePitcher;
-    const awayLine = extractPitcherStrikeoutLine(bookmaker, awayPitcher?.fullName);
-    const homeLine = extractPitcherStrikeoutLine(bookmaker, homePitcher?.fullName);
-
-    if (awayPitcher?.id && awayLine !== null) {
-      linesByPitcherId[awayPitcher.id] = {
-        line: awayLine,
-        sportsbookKey: bookmaker?.key ?? "sportsbook",
-        sportsbookTitle: bookmaker?.title ?? bookmaker?.key ?? "Sportsbook"
-      };
-    }
-    if (homePitcher?.id && homeLine !== null) {
-      linesByPitcherId[homePitcher.id] = {
-        line: homeLine,
-        sportsbookKey: bookmaker?.key ?? "sportsbook",
-        sportsbookTitle: bookmaker?.title ?? bookmaker?.key ?? "Sportsbook"
-      };
-    }
+    debug.endpoint = "/odds/lines/by-games";
+    const payload = await fetchBackendOddsJson("/odds/lines/by-games", {
+      games: [game],
+      preferredBookmakerKey,
+      regions,
+      forceRefresh
+    });
+    const linesByPitcherId = normalizeBackendLinesMap(payload?.linesByPitcherId);
 
     if (Object.keys(linesByPitcherId).length) {
-      pitcherStrikeoutLineCache.set(cacheKey, linesByPitcherId);
+      const firstPitcher = Object.values(linesByPitcherId)[0];
+      debug.bookmakerKey = firstPitcher?.sportsbookKey ?? "";
+      setCachedOddsLines(cacheKey, linesByPitcherId);
     } else {
-      debug.error = "No matching pitcher outcomes";
+      debug.error = payload?.error || "No matching pitcher outcomes";
       pitcherStrikeoutLineCache.delete(cacheKey);
     }
 
@@ -740,6 +764,271 @@ export async function fetchTeamStrikeoutsByGame(teamId, season) {
     teamStrikeoutsByGameCache.set(cacheKey, []);
     return [];
   }
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getMean(values) {
+  if (!values.length) {
+    return 0;
+  }
+  const total = values.reduce((acc, value) => acc + value, 0);
+  return total / values.length;
+}
+
+function getMedian(values) {
+  if (!values.length) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2) {
+    return sorted[middle];
+  }
+  return (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function getStdDev(values, precomputedMean = null) {
+  if (values.length <= 1) {
+    return 1;
+  }
+  const mean = precomputedMean ?? getMean(values);
+  const variance =
+    values.reduce((acc, value) => acc + (value - mean) ** 2, 0) / (values.length - 1);
+  return Math.sqrt(Math.max(variance, 0));
+}
+
+function parseInningsPitched(inningsValue) {
+  if (inningsValue === undefined || inningsValue === null || inningsValue === "") {
+    return 0;
+  }
+  const [wholePartRaw, decimalPartRaw = "0"] = `${inningsValue}`.split(".");
+  const wholePart = Number(wholePartRaw);
+  if (!Number.isFinite(wholePart)) {
+    return 0;
+  }
+  const decimalPart = decimalPartRaw.trim();
+  if (decimalPart === "1") {
+    return wholePart + 1 / 3;
+  }
+  if (decimalPart === "2") {
+    return wholePart + 2 / 3;
+  }
+  return wholePart;
+}
+
+function normalizeHandednessCode(handedness) {
+  const normalized = `${handedness ?? ""}`.toLowerCase().trim();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized === "r" || normalized.startsWith("der")) {
+    return "R";
+  }
+  if (normalized === "l" || normalized.startsWith("zur")) {
+    return "L";
+  }
+  return "";
+}
+
+function approximateErf(value) {
+  const sign = value >= 0 ? 1 : -1;
+  const x = Math.abs(value);
+  const a1 = 0.254829592;
+  const a2 = -0.284496736;
+  const a3 = 1.421413741;
+  const a4 = -1.453152027;
+  const a5 = 1.061405429;
+  const p = 0.3275911;
+
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) * Math.exp(-x * x);
+  return sign * y;
+}
+
+function normalCdf(x, mean, stdDev) {
+  if (!Number.isFinite(stdDev) || stdDev <= 0) {
+    return x < mean ? 0 : 1;
+  }
+  const z = (x - mean) / (stdDev * Math.sqrt(2));
+  return 0.5 * (1 + approximateErf(z));
+}
+
+function americanOddsToImpliedProbability(odds) {
+  const numericOdds = Number(odds);
+  if (!Number.isFinite(numericOdds) || numericOdds === 0) {
+    return null;
+  }
+  if (numericOdds > 0) {
+    return 100 / (numericOdds + 100);
+  }
+  return Math.abs(numericOdds) / (Math.abs(numericOdds) + 100);
+}
+
+export async function evaluatePitcherStrikeoutValueByGames(
+  games,
+  linesByPitcherId,
+  { season, pitcherHandednessById = {}, recentGamesWindow = 10 } = {}
+) {
+  if (!Array.isArray(games) || !games.length || !linesByPitcherId) {
+    return {};
+  }
+
+  const seasonToUse =
+    season || games?.[0]?.season || games?.[0]?.officialDate?.split("-")?.[0] || "";
+  if (!seasonToUse) {
+    return {};
+  }
+
+  const analysisTargets = [];
+  for (const game of games) {
+    if (!game || hasGameStarted(game)) {
+      continue;
+    }
+
+    const awayPitcherId = game?.teams?.away?.probablePitcher?.id;
+    const homePitcherId = game?.teams?.home?.probablePitcher?.id;
+    const awayLine = linesByPitcherId?.[awayPitcherId];
+    const homeLine = linesByPitcherId?.[homePitcherId];
+
+    if (awayPitcherId && awayLine?.line !== undefined) {
+      analysisTargets.push({
+        pitcherId: awayPitcherId,
+        opponentTeamId: game?.teams?.home?.team?.id
+      });
+    }
+    if (homePitcherId && homeLine?.line !== undefined) {
+      analysisTargets.push({
+        pitcherId: homePitcherId,
+        opponentTeamId: game?.teams?.away?.team?.id
+      });
+    }
+  }
+
+  if (!analysisTargets.length) {
+    return {};
+  }
+
+  const uniquePitcherIds = [...new Set(analysisTargets.map((target) => target.pitcherId).filter(Boolean))];
+  const uniqueOpponentIds = [
+    ...new Set(analysisTargets.map((target) => target.opponentTeamId).filter(Boolean))
+  ];
+
+  const [pitcherLogsEntries, opponentTeamLogsEntries] = await Promise.all([
+    Promise.all(
+      uniquePitcherIds.map(async (pitcherId) => {
+        const logs = await fetchPitcherGameLogs(pitcherId, seasonToUse);
+        return [pitcherId, logs];
+      })
+    ),
+    Promise.all(
+      uniqueOpponentIds.map(async (teamId) => {
+        const logs = await fetchTeamStrikeoutsByGame(teamId, seasonToUse);
+        return [teamId, logs];
+      })
+    )
+  ]);
+
+  const pitcherLogsById = Object.fromEntries(pitcherLogsEntries);
+  const opponentTeamLogsById = Object.fromEntries(opponentTeamLogsEntries);
+  const evaluationByPitcherId = {};
+  const leagueStarterKsBaseline = 6.5;
+
+  for (const target of analysisTargets) {
+    const { pitcherId, opponentTeamId } = target;
+    const lineNode = linesByPitcherId?.[pitcherId];
+    const offeredLine = Number(lineNode?.line);
+    if (!Number.isFinite(offeredLine)) {
+      evaluationByPitcherId[pitcherId] = {
+        valueLabel: "Sin evaluar",
+        unavailableReason: "Linea invalida o no disponible",
+        statsSampleSize: 0,
+        opponentSampleSize: 0
+      };
+      continue;
+    }
+
+    const pitcherLogs = (pitcherLogsById?.[pitcherId] ?? []).slice(0, recentGamesWindow);
+    const strikeoutValues = pitcherLogs
+      .map((log) => Number(log?.strikeOuts))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    if (strikeoutValues.length < 3) {
+      evaluationByPitcherId[pitcherId] = {
+        valueLabel: "Sin evaluar",
+        unavailableReason: `Muestra insuficiente del pitcher (${strikeoutValues.length} juegos)`,
+        statsSampleSize: strikeoutValues.length,
+        opponentSampleSize: 0
+      };
+      continue;
+    }
+
+    const mean10 = getMean(strikeoutValues);
+    const mean5 = getMean(strikeoutValues.slice(0, 5)) || mean10;
+    const median10 = getMedian(strikeoutValues);
+    const baseProjection = mean10 * 0.5 + median10 * 0.3 + mean5 * 0.2;
+
+    const inningsValues = pitcherLogs
+      .map((log) => parseInningsPitched(log?.inningsPitched))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const meanRecentInnings = inningsValues.length ? getMean(inningsValues) : 5.5;
+    const workloadFactor = clamp(meanRecentInnings / 5.5, 0.85, 1.15);
+
+    const opponentLogs = opponentTeamLogsById?.[opponentTeamId] ?? [];
+    const pitcherHandCode = normalizeHandednessCode(pitcherHandednessById?.[pitcherId]);
+    const opponentAllValues = opponentLogs
+      .map((log) => Number(log?.opposingStarterStrikeOuts))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    const opponentByHandValues = opponentLogs
+      .filter((log) => normalizeHandednessCode(log?.opposingStarterHandedness) === pitcherHandCode)
+      .map((log) => Number(log?.opposingStarterStrikeOuts))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    const opponentReferenceValues =
+      opponentByHandValues.length >= 5 ? opponentByHandValues : opponentAllValues;
+    const opponentAvg = opponentReferenceValues.length
+      ? getMean(opponentReferenceValues)
+      : leagueStarterKsBaseline;
+    const opponentFactor = clamp(opponentAvg / leagueStarterKsBaseline, 0.8, 1.2);
+
+    const projectedStrikeouts = baseProjection * workloadFactor * opponentFactor;
+    const stdDev = Math.max(getStdDev(strikeoutValues, mean10), 1);
+    const probabilityOver = clamp(1 - normalCdf(offeredLine + 0.5, projectedStrikeouts, stdDev), 0, 1);
+    const impliedOverProbability = americanOddsToImpliedProbability(lineNode?.overPrice);
+    const edgeOver = impliedOverProbability === null ? null : probabilityOver - impliedOverProbability;
+    const zScore = (projectedStrikeouts - offeredLine) / stdDev;
+
+    let valueLabel = "Nula";
+    if (edgeOver !== null) {
+      if (edgeOver >= 0.04) {
+        valueLabel = "Valor";
+      } else if (edgeOver <= -0.03) {
+        valueLabel = "Sobrevalorada";
+      }
+    } else if (zScore >= 0.35) {
+      valueLabel = "Valor";
+    } else if (zScore <= -0.35) {
+      valueLabel = "Sobrevalorada";
+    }
+
+    evaluationByPitcherId[pitcherId] = {
+      valueLabel,
+      projectedStrikeouts,
+      probabilityOver,
+      impliedOverProbability,
+      edgeOver,
+      zScore,
+      unavailableReason: "",
+      offeredLine,
+      baseProjection,
+      workloadFactor,
+      opponentFactor,
+      statsSampleSize: strikeoutValues.length,
+      opponentSampleSize: opponentReferenceValues.length
+    };
+  }
+
+  return evaluationByPitcherId;
 }
 
 function normalizeLineupTeam(teamNode) {

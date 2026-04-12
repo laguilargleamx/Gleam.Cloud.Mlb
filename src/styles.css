@@ -357,6 +357,7 @@ body {
   background: transparent;
   width: 100%;
   padding: 0;
+  position: relative;
 }
 
 .pitcher-block-clickable {
@@ -388,6 +389,51 @@ body {
   flex-direction: column;
   gap: 0.14rem;
   min-width: 0;
+}
+
+.pitcher-block.has-recommendation-badge .pitcher-text {
+  padding-right: 5.3rem;
+}
+
+.pitcher-recommendation-badge {
+  position: absolute;
+  top: 0.15rem;
+  right: 0.2rem;
+  border-radius: 999px;
+  padding: 0.18rem 0.46rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.34rem;
+  font-size: 0.68rem;
+  line-height: 1;
+  border: 1px solid transparent;
+  pointer-events: none;
+}
+
+.pitcher-recommendation-badge strong {
+  font-size: 0.68rem;
+}
+
+.pitcher-recommendation-badge span {
+  font-size: 0.68rem;
+}
+
+.pitcher-recommendation-badge.over {
+  color: #166534;
+  border-color: #86efac;
+  background: #dcfce7;
+}
+
+.pitcher-recommendation-badge.under {
+  color: #991b1b;
+  border-color: #fca5a5;
+  background: #fee2e2;
+}
+
+.pitcher-recommendation-badge.nula {
+  color: #1d4ed8;
+  border-color: #93c5fd;
+  background: #dbeafe;
 }
 
 .pitcher-text span {
