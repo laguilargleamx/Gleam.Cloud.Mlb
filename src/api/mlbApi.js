@@ -963,6 +963,40 @@ function americanOddsToImpliedProbability(odds) {
   return Math.abs(numericOdds) / (Math.abs(numericOdds) + 100);
 }
 
+function getOverThreshold(offeredLine) {
+  if (!Number.isFinite(offeredLine)) {
+    return offeredLine;
+  }
+  const fractional = Math.abs(offeredLine % 1);
+  // For .5 lines, using line directly avoids under bias.
+  if (Math.abs(fractional - 0.5) < 0.0001) {
+    return offeredLine;
+  }
+  // Integer lines need continuity correction because Over means strictly above.
+  if (fractional < 0.0001) {
+    return offeredLine + 0.5;
+  }
+  return offeredLine;
+}
+
+function estimateNoVigOverProbability(overOdds, underOdds) {
+  const impliedOver = americanOddsToImpliedProbability(overOdds);
+  const impliedUnder = americanOddsToImpliedProbability(underOdds);
+  if (
+    !Number.isFinite(impliedOver) ||
+    !Number.isFinite(impliedUnder) ||
+    impliedOver <= 0 ||
+    impliedUnder <= 0
+  ) {
+    return null;
+  }
+  const total = impliedOver + impliedUnder;
+  if (!Number.isFinite(total) || total <= 0) {
+    return null;
+  }
+  return impliedOver / total;
+}
+
 export async function evaluatePitcherStrikeoutValueByGames(
   games,
   linesByPitcherId,
@@ -1089,9 +1123,17 @@ export async function evaluatePitcherStrikeoutValueByGames(
 
     const projectedStrikeouts = baseProjection * workloadFactor * opponentFactor;
     const stdDev = Math.max(getStdDev(strikeoutValues, mean10), 1);
-    const probabilityOver = clamp(1 - normalCdf(offeredLine + 0.5, projectedStrikeouts, stdDev), 0, 1);
+    const lineThresholdUsed = getOverThreshold(offeredLine);
+    const probabilityOver = clamp(1 - normalCdf(lineThresholdUsed, projectedStrikeouts, stdDev), 0, 1);
     const impliedOverProbability = americanOddsToImpliedProbability(lineNode?.overPrice);
-    const edgeOver = impliedOverProbability === null ? null : probabilityOver - impliedOverProbability;
+    const impliedOverProbabilityNoVig = estimateNoVigOverProbability(
+      lineNode?.overPrice,
+      lineNode?.underPrice
+    );
+    const benchmarkProbability = Number.isFinite(impliedOverProbabilityNoVig)
+      ? impliedOverProbabilityNoVig
+      : impliedOverProbability;
+    const edgeOver = benchmarkProbability === null ? null : probabilityOver - benchmarkProbability;
     const zScore = (projectedStrikeouts - offeredLine) / stdDev;
 
     let valueLabel = "Nula";
@@ -1112,15 +1154,23 @@ export async function evaluatePitcherStrikeoutValueByGames(
       projectedStrikeouts,
       probabilityOver,
       impliedOverProbability,
+      impliedOverProbabilityNoVig,
       edgeOver,
       zScore,
       unavailableReason: "",
       offeredLine,
+      lineThresholdUsed,
       baseProjection,
       workloadFactor,
       opponentFactor,
       statsSampleSize: strikeoutValues.length,
-      opponentSampleSize: opponentReferenceValues.length
+      opponentSampleSize: opponentReferenceValues.length,
+      decisionReason:
+        valueLabel === "Valor"
+          ? `Proyeccion (${projectedStrikeouts.toFixed(1)}K) por encima de linea (${offeredLine.toFixed(1)}K) con edge ${((edgeOver ?? 0) * 100).toFixed(1)}%.`
+          : valueLabel === "Sobrevalorada"
+            ? `Proyeccion (${projectedStrikeouts.toFixed(1)}K) por debajo de linea (${offeredLine.toFixed(1)}K) con edge ${((edgeOver ?? 0) * 100).toFixed(1)}%.`
+            : `Proyeccion cercana a linea y edge limitado (${Number.isFinite(edgeOver) ? `${(edgeOver * 100).toFixed(1)}%` : "N/D"}).`
     };
   }
 

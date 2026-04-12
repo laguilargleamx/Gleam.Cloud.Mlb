@@ -193,11 +193,18 @@ function formatRecommendationNarrative(strikeoutValue) {
   const opponentSample = Number(strikeoutValue?.opponentSampleSize) || 0;
   const opponentFactor = Number(strikeoutValue?.opponentFactor);
   const workloadFactor = Number(strikeoutValue?.workloadFactor);
+  const baseProjection = Number(strikeoutValue?.baseProjection);
+  const lineThresholdUsed = Number(strikeoutValue?.lineThresholdUsed);
+  const marketOverNoVig = Number(strikeoutValue?.impliedOverProbabilityNoVig);
+  const decisionReason = `${strikeoutValue?.decisionReason || ""}`.trim();
 
   const projectedLabel = Number.isFinite(projected) ? projected.toFixed(1) : "--";
   const lineLabel = Number.isFinite(line) ? line.toFixed(1) : "--";
+  const thresholdLabel = Number.isFinite(lineThresholdUsed) ? lineThresholdUsed.toFixed(1) : lineLabel;
   const overLabel = formatPercentFromRatio(probabilityOver);
   const edgeLabel = Number.isFinite(edge) ? formatSignedPercentFromRatio(edge) : "N/D";
+  const marketLabel = Number.isFinite(marketOverNoVig) ? formatPercentFromRatio(marketOverNoVig) : "N/D";
+  const baseLabel = Number.isFinite(baseProjection) ? baseProjection.toFixed(1) : "--";
   const rivalImpact = Number.isFinite(opponentFactor)
     ? opponentFactor >= 1
       ? "favorece algo mas de ponches"
@@ -210,13 +217,13 @@ function formatRecommendationNarrative(strikeoutValue) {
     : "con carga reciente no concluyente";
 
   if (label === "valor") {
-    return `Se sugiere valor en esta linea: la proyeccion es ${projectedLabel} K frente a ${lineLabel} K, con P(Over) ${overLabel} y edge ${edgeLabel}. El rival ${rivalImpact} y el modelo usa ${sampleSize} juegos recientes del pitcher (${opponentSample} del rival), ${workloadImpact}.`;
+    return `Se sugiere valor en esta linea: Proy ${projectedLabel}K (base ${baseLabel} x carga x rival) vs linea ${lineLabel}K. Probabilidad real modelada P(Over) ${overLabel} (umbral ${thresholdLabel}) vs mercado ${marketLabel}; edge ${edgeLabel}. El rival ${rivalImpact} y el modelo usa ${sampleSize} juegos del pitcher (${opponentSample} del rival), ${workloadImpact}. ${decisionReason}`;
   }
   if (label === "sobrevalorada") {
-    return `Se considera sobrevalorada esta linea: la proyeccion es ${projectedLabel} K frente a ${lineLabel} K, con P(Over) ${overLabel} y edge ${edgeLabel}. El rival ${rivalImpact} y la muestra del modelo incluye ${sampleSize} juegos del pitcher (${opponentSample} del rival), ${workloadImpact}.`;
+    return `Se considera sobrevalorada esta linea: Proy ${projectedLabel}K (base ${baseLabel} x carga x rival) vs linea ${lineLabel}K. Probabilidad real modelada P(Over) ${overLabel} (umbral ${thresholdLabel}) vs mercado ${marketLabel}; edge ${edgeLabel}. El rival ${rivalImpact} y la muestra del modelo incluye ${sampleSize} juegos del pitcher (${opponentSample} del rival), ${workloadImpact}. ${decisionReason}`;
   }
 
-  return `Linea considerada nula: la proyeccion (${projectedLabel} K) queda cerca de la oferta (${lineLabel} K), con P(Over) ${overLabel} y edge ${edgeLabel}. Se apoya en ${sampleSize} juegos recientes del pitcher y ${opponentSample} del rival, ${workloadImpact}.`;
+  return `Linea considerada nula: Proy ${projectedLabel}K (base ${baseLabel} x carga x rival) cerca de linea ${lineLabel}K. Probabilidad real modelada P(Over) ${overLabel} (umbral ${thresholdLabel}) vs mercado ${marketLabel}; edge ${edgeLabel}. Se apoya en ${sampleSize} juegos recientes del pitcher y ${opponentSample} del rival, ${workloadImpact}. ${decisionReason}`;
 }
 
 function getRecommendationBadge(strikeoutValue) {
