@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   evaluatePitcherStrikeoutValueByGames,
   fetchPitcherStrikeoutLinesForGame,
@@ -11,6 +11,13 @@ import {
 } from "./api/mlbApi";
 import DateFilter from "./components/DateFilter";
 import GamesList from "./components/GamesList";
+
+const APP_DATA_CACHE_PREFIX = "mlb-app-data-cache-v1";
+const configuredAppDataCacheTtlMinutes = Number(import.meta.env.VITE_APP_DATA_CACHE_TTL_MINUTES);
+const APP_DATA_CACHE_TTL_MS =
+  Number.isFinite(configuredAppDataCacheTtlMinutes) && configuredAppDataCacheTtlMinutes > 0
+    ? configuredAppDataCacheTtlMinutes * 60 * 1000
+    : 30 * 60 * 1000;
 
 function getTodayIsoDate() {
   const now = new Date();
@@ -66,6 +73,51 @@ function getMatchPriority(game) {
   return 2;
 }
 
+function getAppDataCacheKey(selectedDate) {
+  return `${APP_DATA_CACHE_PREFIX}:${selectedDate}`;
+}
+
+function readAppDataCache(selectedDate) {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const raw = window.localStorage.getItem(getAppDataCacheKey(selectedDate));
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    const cachedAt = Number(parsed?.cachedAt);
+    if (!cachedAt || Number.isNaN(cachedAt)) {
+      return null;
+    }
+    if (Date.now() - cachedAt > APP_DATA_CACHE_TTL_MS) {
+      window.localStorage.removeItem(getAppDataCacheKey(selectedDate));
+      return null;
+    }
+    return parsed?.payload ?? null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function writeAppDataCache(selectedDate, payload) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(
+      getAppDataCacheKey(selectedDate),
+      JSON.stringify({
+        cachedAt: Date.now(),
+        payload
+      })
+    );
+  } catch (error) {
+    // Ignore cache write failures (quota/privacy mode).
+  }
+}
+
 export default function App() {
   const todayDate = useMemo(() => getTodayIsoDate(), []);
   const minSelectableDate = useMemo(() => addDays(todayDate, -3), [todayDate]);
@@ -81,16 +133,41 @@ export default function App() {
   const [gamesViewMode, setGamesViewMode] = useState("all");
   const [selectedMatchFilter, setSelectedMatchFilter] = useState("all");
   const [loading, setLoading] = useState(false);
+  const [refreshSeed, setRefreshSeed] = useState(0);
+  const handledRefreshSeedRef = useRef(0);
   const [error, setError] = useState("");
 
   useEffect(() => {
     let ignore = false;
+    const forceRefresh = refreshSeed !== handledRefreshSeedRef.current;
+    handledRefreshSeedRef.current = refreshSeed;
+
+    function applyLoadedData(snapshot) {
+      setGames(snapshot?.games ?? []);
+      setPitcherErasById(snapshot?.pitcherErasById ?? {});
+      setPitcherStrikeoutsPerGameById(snapshot?.pitcherStrikeoutsPerGameById ?? {});
+      setPitcherStrikeoutLinesById(snapshot?.pitcherStrikeoutLinesById ?? {});
+      setPitcherStrikeoutValueById(snapshot?.pitcherStrikeoutValueById ?? {});
+      setPitcherHandednessById(snapshot?.pitcherHandednessById ?? {});
+    }
 
     async function loadGames() {
       setLoading(true);
       setOddsLoading(true);
       setError("");
       try {
+        if (!forceRefresh) {
+          const cached = readAppDataCache(selectedDate);
+          if (cached) {
+            if (!ignore) {
+              applyLoadedData(cached);
+              setOddsLoading(false);
+              setLoading(false);
+            }
+            return;
+          }
+        }
+
         const payload = await fetchMlbScheduleByDate(selectedDate);
         const dateNode = payload.dates?.[0];
         const fetchedGames = dateNode?.games ?? [];
@@ -113,12 +190,16 @@ export default function App() {
         );
 
         if (!ignore) {
-          setGames(fetchedGames);
-          setPitcherErasById(erasMap);
-          setPitcherStrikeoutsPerGameById(strikeoutsPerGameMap);
-          setPitcherStrikeoutLinesById(strikeoutLinesMap);
-          setPitcherStrikeoutValueById(strikeoutValueMap);
-          setPitcherHandednessById(handednessMap);
+          const nextSnapshot = {
+            games: fetchedGames,
+            pitcherErasById: erasMap,
+            pitcherStrikeoutsPerGameById: strikeoutsPerGameMap,
+            pitcherStrikeoutLinesById: strikeoutLinesMap,
+            pitcherStrikeoutValueById: strikeoutValueMap,
+            pitcherHandednessById: handednessMap
+          };
+          applyLoadedData(nextSnapshot);
+          writeAppDataCache(selectedDate, nextSnapshot);
           setOddsLoading(false);
         }
       } catch (err) {
@@ -143,7 +224,7 @@ export default function App() {
     return () => {
       ignore = true;
     };
-  }, [selectedDate]);
+  }, [selectedDate, refreshSeed]);
 
   const subtitle = useMemo(() => {
     return `Mostrando juegos para ${selectedDate}`;
@@ -211,17 +292,24 @@ export default function App() {
       nextLinesByPitcherId,
       { season, pitcherHandednessById }
     );
+    const nextStrikeoutValueById = { ...pitcherStrikeoutValueById };
+    if (awayPitcherId) {
+      delete nextStrikeoutValueById[awayPitcherId];
+    }
+    if (homePitcherId) {
+      delete nextStrikeoutValueById[homePitcherId];
+    }
+    Object.assign(nextStrikeoutValueById, refreshedValueMap);
 
     setPitcherStrikeoutLinesById(nextLinesByPitcherId);
-    setPitcherStrikeoutValueById((current) => {
-      const next = { ...current };
-      if (awayPitcherId) {
-        delete next[awayPitcherId];
-      }
-      if (homePitcherId) {
-        delete next[homePitcherId];
-      }
-      return { ...next, ...refreshedValueMap };
+    setPitcherStrikeoutValueById(nextStrikeoutValueById);
+    writeAppDataCache(selectedDate, {
+      games,
+      pitcherErasById,
+      pitcherStrikeoutsPerGameById,
+      pitcherStrikeoutLinesById: nextLinesByPitcherId,
+      pitcherStrikeoutValueById: nextStrikeoutValueById,
+      pitcherHandednessById
     });
 
     return result.debug;
@@ -252,6 +340,16 @@ export default function App() {
           onClick={() => setGamesViewMode("all")}
         >
           Todos
+        </button>
+        <button
+          type="button"
+          className="games-view-button"
+          onClick={() => {
+            setRefreshSeed((current) => current + 1);
+          }}
+          disabled={loading}
+        >
+          {loading ? "Refrescando data..." : "Refrescar data (fecha)"}
         </button>
       </div>
       <div className="match-filter-strip" role="tablist" aria-label="Filtro por match">
