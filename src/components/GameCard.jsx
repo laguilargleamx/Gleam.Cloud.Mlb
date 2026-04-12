@@ -398,13 +398,21 @@ function PitcherBlock({
           <small>Cargando odds...</small>
         ) : strikeoutLine?.line !== undefined ? (
           <>
-            <small>
+            <small className="pitcher-line-meta">
               {strikeoutLine?.sportsbookTitle ?? "Sportsbook"}: {strikeoutLine.line} K
               {lineUpdatedLabel ? ` · Ultima actualizacion ${lineUpdatedLabel}` : ""}
             </small>
-            {valueSummary ? <small>{valueSummary}</small> : null}
-            {projectionDeltaLabel ? <small>{projectionDeltaLabel}</small> : null}
-            {recommendationNarrative ? <small>{recommendationNarrative}</small> : null}
+            {valueSummary || projectionDeltaLabel || recommendationNarrative ? (
+              <div className="pitcher-eval-block">
+                {valueSummary ? <small className="pitcher-eval-summary">{valueSummary}</small> : null}
+                {projectionDeltaLabel ? (
+                  <small className="pitcher-eval-delta">{projectionDeltaLabel}</small>
+                ) : null}
+                {recommendationNarrative ? (
+                  <small className="pitcher-eval-narrative">{recommendationNarrative}</small>
+                ) : null}
+              </div>
+            ) : null}
           </>
         ) : (
           <small>Sin linea de sportsbook</small>

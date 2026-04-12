@@ -632,6 +632,33 @@ body {
   opacity: 0.85;
 }
 
+.pitcher-line-meta {
+  margin-top: 0.06rem;
+}
+
+.pitcher-eval-block {
+  margin-top: 0.16rem;
+  padding-top: 0.24rem;
+  border-top: 1px dashed #e5e7eb;
+  display: grid;
+  gap: 0.18rem;
+}
+
+.pitcher-eval-summary {
+  font-weight: 600;
+  opacity: 0.95;
+}
+
+.pitcher-eval-delta {
+  color: #374151;
+  opacity: 0.95;
+}
+
+.pitcher-eval-narrative {
+  line-height: 1.35;
+  color: #374151;
+}
+
 .lineup-toggle {
   border: 1px solid #d1d5db;
   background: #ffffff;
