@@ -176,6 +176,20 @@ function formatStrikeoutValueSummary(strikeoutValue) {
   return `${strikeoutValue?.valueLabel ?? "Nula"}${edgeLabel} · Proy ${projectedLabel} K · P(Over) ${probabilityLabel}`;
 }
 
+function formatProjectionDelta(strikeoutValue) {
+  if (!strikeoutValue || strikeoutValue?.unavailableReason) {
+    return "";
+  }
+  const projected = Number(strikeoutValue?.projectedStrikeouts);
+  const offeredLine = Number(strikeoutValue?.offeredLine);
+  if (!Number.isFinite(projected) || !Number.isFinite(offeredLine)) {
+    return "";
+  }
+  const delta = projected - offeredLine;
+  const sign = delta > 0 ? "+" : "";
+  return `Delta Proy-Linea: ${sign}${delta.toFixed(1)} K`;
+}
+
 function formatRecommendationNarrative(strikeoutValue) {
   if (!strikeoutValue) {
     return "";
@@ -337,6 +351,7 @@ function PitcherBlock({
   const hasPitcher = Boolean(pitcher?.id);
   const lineUpdatedLabel = formatRelativeUpdateTime(strikeoutLine?.updatedAt);
   const valueSummary = formatStrikeoutValueSummary(strikeoutValue);
+  const projectionDeltaLabel = formatProjectionDelta(strikeoutValue);
   const recommendationNarrative = formatRecommendationNarrative(strikeoutValue);
   const recommendationBadge = getRecommendationBadge(strikeoutValue);
 
@@ -388,6 +403,7 @@ function PitcherBlock({
               {lineUpdatedLabel ? ` · Ultima actualizacion ${lineUpdatedLabel}` : ""}
             </small>
             {valueSummary ? <small>{valueSummary}</small> : null}
+            {projectionDeltaLabel ? <small>{projectionDeltaLabel}</small> : null}
             {recommendationNarrative ? <small>{recommendationNarrative}</small> : null}
           </>
         ) : (
