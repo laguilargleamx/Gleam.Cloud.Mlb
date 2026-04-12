@@ -18,6 +18,125 @@ body {
   padding: 1rem;
 }
 
+.auth-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+}
+
+.auth-card {
+  width: min(420px, 100%);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 1rem;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.auth-card h1 {
+  margin: 0;
+}
+
+.auth-logo {
+  width: min(180px, 60%);
+  height: auto;
+  justify-self: center;
+  object-fit: contain;
+  mix-blend-mode: multiply;
+}
+
+.auth-card p {
+  margin: 0;
+}
+
+.auth-form {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.auth-form label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.88rem;
+}
+
+.auth-form input[type="text"],
+.auth-form input[type="password"] {
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 0.45rem 0.55rem;
+}
+
+.password-input-wrap {
+  position: relative;
+}
+
+.password-input-wrap input {
+  width: 100%;
+  padding-right: 2.3rem;
+}
+
+.password-toggle {
+  position: absolute;
+  right: 0.2rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1.9rem;
+  height: 1.9rem;
+  border: 0;
+  background: transparent;
+  border-radius: 999px;
+  padding: 0.25rem;
+  cursor: pointer;
+  color: #4b5563;
+  display: grid;
+  place-items: center;
+}
+
+.password-toggle:hover {
+  background: #f3f4f6;
+}
+
+.password-toggle svg {
+  width: 1.1rem;
+  height: 1.1rem;
+}
+
+.remember-row {
+  display: flex !important;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.auth-form button {
+  border: 1px solid #111827;
+  background: #111827;
+  color: #ffffff;
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  cursor: pointer;
+}
+
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.app-header h1 {
+  margin: 0;
+}
+
+.logout-button {
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+  border-radius: 8px;
+  padding: 0.38rem 0.66rem;
+  cursor: pointer;
+}
+
 .date-filter {
   display: block;
   margin-bottom: 1rem;
@@ -75,6 +194,64 @@ body {
 .match-filter-tag.active {
   border-color: #6b7280;
   background: #f3f4f6;
+}
+
+.history-panel {
+  border: 1px solid #d1d5db;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 0.8rem;
+  margin: 0 0 0.8rem;
+}
+
+.history-summary {
+  margin: 0 0 0.7rem;
+  font-size: 0.9rem;
+}
+
+.history-table-wrap {
+  overflow-x: auto;
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.history-table th,
+.history-table td {
+  border-bottom: 1px solid #eceff1;
+  padding: 0.35rem 0.28rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.history-status {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.16rem 0.5rem;
+  border: 1px solid transparent;
+  font-size: 0.75rem;
+}
+
+.history-status.success {
+  color: #166534;
+  border-color: #86efac;
+  background: #dcfce7;
+}
+
+.history-status.failed {
+  color: #991b1b;
+  border-color: #fca5a5;
+  background: #fee2e2;
+}
+
+.history-status.pending {
+  color: #1d4ed8;
+  border-color: #93c5fd;
+  background: #dbeafe;
 }
 
 .match-status-dot {

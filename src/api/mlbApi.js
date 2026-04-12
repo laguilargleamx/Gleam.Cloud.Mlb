@@ -20,6 +20,7 @@ const lineupCache = new Map();
 const playerHittingStatsCache = new Map();
 const playerHittingStreakCache = new Map();
 const pitcherStrikeoutLineCache = new Map();
+let backendAccessToken = "";
 
 const TEAM_ABBR_BY_ID = {
   108: "laa",
@@ -222,17 +223,112 @@ function buildBackendApiUrl(pathname) {
   return new URL(`${base}${path}`);
 }
 
-async function fetchBackendOddsJson(pathname, payload) {
-  const url = buildBackendApiUrl(pathname);
+export function setBackendAccessToken(token) {
+  backendAccessToken = `${token || ""}`.trim();
+}
+
+function buildAuthenticatedHeaders() {
+  if (!backendAccessToken) {
+    throw new Error("Missing backend auth token.");
+  }
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${backendAccessToken}`
+  };
+}
+
+export async function loginToBackend({ username, password, rememberMe }) {
+  const url = buildBackendApiUrl("/auth/login");
   const response = await fetch(url.toString(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
+    body: JSON.stringify({
+      username,
+      password,
+      rememberMe
+    })
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = payload?.detail || `Backend auth error ${response.status}`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+export async function fetchBackendSession() {
+  const url = buildBackendApiUrl("/auth/me");
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: buildAuthenticatedHeaders()
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = payload?.detail || `Backend auth check error ${response.status}`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+export async function logoutFromBackend() {
+  const url = buildBackendApiUrl("/auth/logout");
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: buildAuthenticatedHeaders()
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = payload?.detail || `Backend logout error ${response.status}`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+export async function fetchRecommendationHistoryFromBackend() {
+  const url = buildBackendApiUrl("/recommendations/history");
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: buildAuthenticatedHeaders()
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = payload?.detail || `Backend recommendation history error ${response.status}`;
+    throw new Error(message);
+  }
+  return Array.isArray(payload?.entries) ? payload.entries : [];
+}
+
+export async function upsertRecommendationHistoryToBackend(entries) {
+  const url = buildBackendApiUrl("/recommendations/history/upsert");
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: buildAuthenticatedHeaders(),
+    body: JSON.stringify({
+      entries: Array.isArray(entries) ? entries : []
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = payload?.detail || `Backend recommendation upsert error ${response.status}`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+async function fetchBackendOddsJson(pathname, payload) {
+  const url = buildBackendApiUrl(pathname);
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: buildAuthenticatedHeaders(),
     body: JSON.stringify(payload ?? {})
   });
   if (!response.ok) {
-    throw new Error(`Backend odds API error ${response.status}`);
+    const errorPayload = await response.json().catch(() => ({}));
+    const detail = errorPayload?.detail || `Backend odds API error ${response.status}`;
+    throw new Error(detail);
   }
   return response.json();
 }

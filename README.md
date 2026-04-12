@@ -87,6 +87,11 @@ flowchart TD
 La app puede usar backend para centralizar llamadas a odds y compartir cache entre dispositivos.
 
 - Carpeta backend: `backend/`
+- Login backend: `POST /auth/login`
+- Sesion backend: `GET /auth/me`
+- Logout backend: `POST /auth/logout`
+- Historial recomendaciones: `GET /recommendations/history`
+- Upsert historial recomendaciones: `POST /recommendations/history/upsert`
 - API principal: `POST /odds/lines/by-games`
 - Healthcheck: `GET /health`
 
@@ -95,6 +100,9 @@ La app puede usar backend para centralizar llamadas a odds y compartir cache ent
 - `THE_ODDS_API_KEY`
 - `THE_ODDS_API_BASE_URL` (opcional, default The Odds v4)
 - `ODDS_CACHE_TTL_MINUTES` (default 10)
+- `APP_AUTH_USERNAME`
+- `APP_AUTH_PASSWORD` o `APP_AUTH_PASSWORD_HASH`
+- `APP_JWT_SECRET`
 - `MYSQLHOST`, `MYSQLPORT`, `MYSQLUSER`, `MYSQLPASSWORD`, `MYSQLDATABASE`
 
 ### Desarrollo local

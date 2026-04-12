@@ -1,4 +1,9 @@
+import base64
+import hashlib
+import hmac
 import os
+import secrets
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -6,12 +11,14 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import jwt
 import pymysql
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pymysql.cursors import DictCursor
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env", override=True)
@@ -20,6 +27,13 @@ ODDS_API_BASE_URL = (os.getenv("THE_ODDS_API_BASE_URL") or "https://api.the-odds
 ODDS_API_KEY = (os.getenv("THE_ODDS_API_KEY") or "").strip()
 ODDS_CACHE_TTL_MINUTES = int(os.getenv("ODDS_CACHE_TTL_MINUTES") or "10")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("ODDS_HTTP_TIMEOUT_SECONDS") or "12")
+APP_AUTH_USERNAME = (os.getenv("APP_AUTH_USERNAME") or "admin").strip()
+APP_AUTH_PASSWORD_HASH = (os.getenv("APP_AUTH_PASSWORD_HASH") or "").strip()
+APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD") or "mlb2026"
+APP_JWT_SECRET = (os.getenv("APP_JWT_SECRET") or "change-me-in-production").strip()
+APP_JWT_ALGORITHM = "HS256"
+APP_JWT_EXPIRES_HOURS = int(os.getenv("APP_JWT_EXPIRES_HOURS") or "12")
+APP_JWT_REMEMBER_DAYS = int(os.getenv("APP_JWT_REMEMBER_DAYS") or "30")
 
 
 class OddsByGamesRequest(BaseModel):
@@ -27,6 +41,16 @@ class OddsByGamesRequest(BaseModel):
     preferredBookmakerKey: str = "draftkings"
     regions: str = "us"
     forceRefresh: bool = False
+
+
+class LoginRequest(BaseModel):
+    username: str = ""
+    password: str = ""
+    rememberMe: bool = True
+
+
+class RecommendationHistoryUpsertRequest(BaseModel):
+    entries: list[dict[str, Any]] = Field(default_factory=list)
 
 
 app = FastAPI(title="Gleam MLB Odds Backend", version="0.1.0")
@@ -37,10 +61,134 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def b64url_encode(raw_bytes: bytes) -> str:
+    return base64.urlsafe_b64encode(raw_bytes).decode("utf-8").rstrip("=")
+
+
+def b64url_decode(raw_text: str) -> bytes:
+    padding = "=" * (-len(raw_text) % 4)
+    return base64.urlsafe_b64decode(raw_text + padding)
+
+
+def hash_password_pbkdf2(password: str, *, salt: bytes | None = None, iterations: int = 210_000) -> str:
+    resolved_salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), resolved_salt, iterations)
+    return f"pbkdf2_sha256${iterations}${b64url_encode(resolved_salt)}${b64url_encode(digest)}"
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        scheme, raw_iterations, raw_salt, raw_digest = password_hash.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        iterations = int(raw_iterations)
+        salt = b64url_decode(raw_salt)
+        expected = b64url_decode(raw_digest)
+        calculated = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(expected, calculated)
+    except Exception:
+        return False
+
+
+def resolve_password_hash() -> str:
+    if APP_AUTH_PASSWORD_HASH:
+        return APP_AUTH_PASSWORD_HASH
+    return hash_password_pbkdf2(APP_AUTH_PASSWORD)
+
+
+RESOLVED_AUTH_PASSWORD_HASH = resolve_password_hash()
+
+
+def issue_access_token(username: str, remember_me: bool) -> tuple[str, datetime]:
+    now = utc_now()
+    expiration = now + (
+        timedelta(days=APP_JWT_REMEMBER_DAYS)
+        if remember_me
+        else timedelta(hours=APP_JWT_EXPIRES_HOURS)
+    )
+    jti = uuid.uuid4().hex
+    payload = {
+        "sub": username,
+        "iat": int(now.timestamp()),
+        "exp": int(expiration.timestamp()),
+        "jti": jti,
+    }
+    token = jwt.encode(payload, APP_JWT_SECRET, algorithm=APP_JWT_ALGORITHM)
+    return token, expiration
+
+
+def decode_bearer_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> tuple[str, dict[str, Any]]:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    token = credentials.credentials or ""
+    try:
+        payload = jwt.decode(token, APP_JWT_SECRET, algorithms=[APP_JWT_ALGORITHM])
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.") from exc
+
+    username = payload.get("sub")
+    if not username or username != APP_AUTH_USERNAME:
+        raise HTTPException(status_code=401, detail="Invalid token subject.")
+    return token, payload
+
+
+def is_token_revoked(conn: pymysql.connections.Connection, token_jti: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 AS hit FROM revoked_access_tokens WHERE token_jti = %s LIMIT 1",
+            (token_jti,),
+        )
+        row = cur.fetchone()
+    return bool(row)
+
+
+def revoke_token(conn: pymysql.connections.Connection, token_jti: str, expires_at_utc: datetime) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO revoked_access_tokens (token_jti, expires_at)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at)
+            """,
+            (token_jti, expires_at_utc.replace(tzinfo=None)),
+        )
+
+
+def prune_expired_revoked_tokens(conn: pymysql.connections.Connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM revoked_access_tokens WHERE expires_at <= %s",
+            (utc_now().replace(tzinfo=None),),
+        )
+
+
+def require_authenticated_user(
+    decoded: tuple[str, dict[str, Any]] = Depends(decode_bearer_token),
+) -> dict[str, Any]:
+    _token, payload = decoded
+    token_jti = str(payload.get("jti") or "").strip()
+    if not token_jti:
+        raise HTTPException(status_code=401, detail="Token missing jti.")
+
+    try:
+        with db_conn() as conn:
+            prune_expired_revoked_tokens(conn)
+            if is_token_revoked(conn, token_jti):
+                raise HTTPException(status_code=401, detail="Token already revoked.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected auth backend error: {exc}") from exc
+    return payload
 
 
 def mysql_connection_kwargs() -> dict[str, Any]:
@@ -115,6 +263,42 @@ def to_unix_ms(value: datetime | None) -> int:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return int(value.timestamp() * 1000)
+
+
+def from_unix_ms(value: Any) -> datetime | None:
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    return datetime.fromtimestamp(numeric / 1000, tz=timezone.utc)
+
+
+def normalize_recommendation_status(status: Any) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"success", "failed", "pending"}:
+        return normalized
+    return "pending"
+
+
+def normalize_recommendation_side(side: Any) -> str:
+    normalized = str(side or "").strip().lower()
+    if normalized == "over":
+        return "Over"
+    if normalized == "under":
+        return "Under"
+    return "Nula"
+
+
+def normalize_history_game_date(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return datetime.fromisoformat(raw[:10]).date().isoformat()
+    except ValueError:
+        return ""
 
 
 async def fetch_odds_json(path: str, params: dict[str, Any]) -> Any:
@@ -196,7 +380,7 @@ def extract_pitcher_line(bookmaker: dict[str, Any], pitcher_name: str | None) ->
 
 
 def create_tables_if_needed() -> None:
-    sql = """
+    odds_sql = """
     CREATE TABLE IF NOT EXISTS pitcher_odds_lines (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       game_pk BIGINT NOT NULL,
@@ -218,9 +402,43 @@ def create_tables_if_needed() -> None:
       KEY idx_exp (expires_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """
+    revoked_tokens_sql = """
+    CREATE TABLE IF NOT EXISTS revoked_access_tokens (
+      token_jti VARCHAR(64) PRIMARY KEY,
+      expires_at DATETIME NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_revoked_exp (expires_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    recommendation_history_sql = """
+    CREATE TABLE IF NOT EXISTS recommendation_history (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      username VARCHAR(64) NOT NULL,
+      entry_key VARCHAR(128) NOT NULL,
+      game_pk BIGINT NOT NULL,
+      game_date DATE NULL,
+      event_label VARCHAR(64) NOT NULL,
+      pitcher_id BIGINT NOT NULL,
+      pitcher_name VARCHAR(128) NOT NULL,
+      offered_line DECIMAL(6,2) NOT NULL,
+      recommendation VARCHAR(12) NOT NULL,
+      probability DECIMAL(6,4) NOT NULL DEFAULT 0,
+      value_label VARCHAR(32) NULL,
+      status VARCHAR(12) NOT NULL DEFAULT 'pending',
+      actual_strikeouts DECIMAL(6,2) NULL,
+      created_at DATETIME NOT NULL,
+      resolved_at DATETIME NULL,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_username_entry (username, entry_key),
+      KEY idx_username_created (username, created_at),
+      KEY idx_username_status (username, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql)
+            cur.execute(odds_sql)
+            cur.execute(revoked_tokens_sql)
+            cur.execute(recommendation_history_sql)
 
 
 def load_cached_game_lines(
@@ -314,6 +532,131 @@ def upsert_line_row(
                 expires_at.replace(tzinfo=None),
             ),
         )
+
+
+def load_recommendation_history(
+    conn: pymysql.connections.Connection, *, username: str
+) -> list[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              entry_key,
+              game_pk,
+              game_date,
+              event_label,
+              pitcher_id,
+              pitcher_name,
+              offered_line,
+              recommendation,
+              probability,
+              value_label,
+              status,
+              actual_strikeouts,
+              created_at,
+              resolved_at
+            FROM recommendation_history
+            WHERE username = %s
+            ORDER BY created_at DESC
+            """,
+            (username,),
+        )
+        rows = cur.fetchall()
+
+    entries: list[dict[str, Any]] = []
+    for row in rows:
+        game_date = row.get("game_date")
+        entries.append(
+            {
+                "entryKey": row.get("entry_key") or "",
+                "gamePk": int(row.get("game_pk") or 0),
+                "gameDate": game_date.isoformat() if game_date else "",
+                "eventLabel": row.get("event_label") or "",
+                "pitcherId": int(row.get("pitcher_id") or 0),
+                "pitcherName": row.get("pitcher_name") or "",
+                "offeredLine": parse_decimal(row.get("offered_line")),
+                "recommendation": row.get("recommendation") or "Nula",
+                "probability": parse_decimal(row.get("probability")) or 0,
+                "valueLabel": row.get("value_label") or "",
+                "status": row.get("status") or "pending",
+                "actualStrikeouts": parse_decimal(row.get("actual_strikeouts")),
+                "createdAt": to_unix_ms(row.get("created_at")),
+                "resolvedAt": to_unix_ms(row.get("resolved_at")) if row.get("resolved_at") else None,
+            }
+        )
+    return entries
+
+
+def upsert_recommendation_history_entry(
+    conn: pymysql.connections.Connection,
+    *,
+    username: str,
+    entry: dict[str, Any],
+) -> bool:
+    entry_key = str(entry.get("entryKey") or "").strip()
+    if not entry_key:
+        return False
+
+    game_pk = int(entry.get("gamePk") or 0)
+    pitcher_id = int(entry.get("pitcherId") or 0)
+    event_label = str(entry.get("eventLabel") or "").strip()
+    pitcher_name = str(entry.get("pitcherName") or "").strip()
+    offered_line = parse_decimal(entry.get("offeredLine"))
+    if not game_pk or not pitcher_id or not event_label or not pitcher_name or offered_line is None:
+        return False
+
+    game_date = normalize_history_game_date(entry.get("gameDate"))
+    recommendation = normalize_recommendation_side(entry.get("recommendation"))
+    probability = parse_decimal(entry.get("probability")) or 0
+    value_label = str(entry.get("valueLabel") or "").strip()
+    status = normalize_recommendation_status(entry.get("status"))
+    actual_strikeouts = parse_decimal(entry.get("actualStrikeouts"))
+    created_at = from_unix_ms(entry.get("createdAt")) or utc_now()
+    resolved_at = from_unix_ms(entry.get("resolvedAt"))
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO recommendation_history (
+              username, entry_key, game_pk, game_date, event_label, pitcher_id,
+              pitcher_name, offered_line, recommendation, probability, value_label,
+              status, actual_strikeouts, created_at, resolved_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+              game_pk = VALUES(game_pk),
+              game_date = VALUES(game_date),
+              event_label = VALUES(event_label),
+              pitcher_id = VALUES(pitcher_id),
+              pitcher_name = VALUES(pitcher_name),
+              offered_line = VALUES(offered_line),
+              recommendation = VALUES(recommendation),
+              probability = VALUES(probability),
+              value_label = VALUES(value_label),
+              status = VALUES(status),
+              actual_strikeouts = VALUES(actual_strikeouts),
+              created_at = VALUES(created_at),
+              resolved_at = VALUES(resolved_at)
+            """,
+            (
+                username,
+                entry_key,
+                game_pk,
+                game_date or None,
+                event_label,
+                pitcher_id,
+                pitcher_name,
+                offered_line,
+                recommendation,
+                probability,
+                value_label or None,
+                status,
+                actual_strikeouts,
+                created_at.replace(tzinfo=None),
+                resolved_at.replace(tzinfo=None) if resolved_at else None,
+            ),
+        )
+    return True
 
 
 async def resolve_lines_for_game(
@@ -416,8 +759,89 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/auth/login")
+def auth_login(req: LoginRequest) -> dict[str, Any]:
+    input_username = req.username.strip()
+    if input_username != APP_AUTH_USERNAME:
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
+
+    if not verify_password(req.password, RESOLVED_AUTH_PASSWORD_HASH):
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
+
+    access_token, expires_at = issue_access_token(APP_AUTH_USERNAME, bool(req.rememberMe))
+    return {
+        "accessToken": access_token,
+        "tokenType": "Bearer",
+        "expiresAt": to_unix_ms(expires_at),
+        "username": APP_AUTH_USERNAME
+    }
+
+
+@app.get("/auth/me")
+def auth_me(auth_payload: dict[str, Any] = Depends(require_authenticated_user)) -> dict[str, Any]:
+    exp_seconds = int(auth_payload.get("exp") or 0)
+    expires_at_ms = exp_seconds * 1000 if exp_seconds > 0 else 0
+    return {
+        "authenticated": True,
+        "username": str(auth_payload.get("sub") or ""),
+        "expiresAt": expires_at_ms,
+    }
+
+
+@app.post("/auth/logout")
+def auth_logout(auth_payload: dict[str, Any] = Depends(require_authenticated_user)) -> dict[str, Any]:
+    token_jti = str(auth_payload.get("jti") or "").strip()
+    exp_seconds = int(auth_payload.get("exp") or 0)
+    if not token_jti or exp_seconds <= 0:
+        raise HTTPException(status_code=400, detail="Invalid token payload.")
+
+    expires_at = datetime.fromtimestamp(exp_seconds, tz=timezone.utc)
+    try:
+        with db_conn() as conn:
+            revoke_token(conn, token_jti, expires_at)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected auth backend error: {exc}") from exc
+
+    return {"ok": True}
+
+
+@app.get("/recommendations/history")
+def recommendations_history(
+    auth_payload: dict[str, Any] = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    username = str(auth_payload.get("sub") or APP_AUTH_USERNAME)
+    try:
+        with db_conn() as conn:
+            entries = load_recommendation_history(conn, username=username)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected history backend error: {exc}") from exc
+
+    return {"entries": entries}
+
+
+@app.post("/recommendations/history/upsert")
+def recommendations_history_upsert(
+    req: RecommendationHistoryUpsertRequest,
+    auth_payload: dict[str, Any] = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    username = str(auth_payload.get("sub") or APP_AUTH_USERNAME)
+    upserted = 0
+    try:
+        with db_conn() as conn:
+            for entry in req.entries:
+                if upsert_recommendation_history_entry(conn, username=username, entry=entry):
+                    upserted += 1
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected history backend error: {exc}") from exc
+
+    return {"ok": True, "upserted": upserted}
+
+
 @app.post("/odds/lines/by-games")
-async def odds_lines_by_games(req: OddsByGamesRequest) -> dict[str, Any]:
+async def odds_lines_by_games(
+    req: OddsByGamesRequest,
+    _auth_payload: dict[str, Any] = Depends(require_authenticated_user),
+) -> dict[str, Any]:
     if not req.games:
         return {"linesByPitcherId": {}}
 
