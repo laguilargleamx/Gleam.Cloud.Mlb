@@ -375,20 +375,39 @@ body {
 
 .top-picks-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.7rem;
 }
 
 .top-picks-card {
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
-  padding: 0.6rem;
-  background: #fafafa;
+  border: 1px solid #dbe1ea;
+  border-radius: 12px;
+  padding: 0.65rem;
+  background: linear-gradient(180deg, #fbfcff 0%, #f8fafc 100%);
+  box-shadow: inset 0 1px 0 #ffffff;
+}
+
+.top-picks-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
 }
 
 .top-picks-card h3 {
-  margin: 0 0 0.45rem;
-  font-size: 0.9rem;
+  margin: 0;
+  font-size: 0.88rem;
+}
+
+.top-picks-domain-icon {
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 0.68rem;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 0.1rem 0.42rem;
 }
 
 .top-picks-card p {
@@ -396,26 +415,47 @@ body {
   font-size: 0.82rem;
 }
 
-.top-picks-card ol {
+.top-picks-list {
   margin: 0;
-  padding-left: 1.1rem;
   display: grid;
-  gap: 0.4rem;
+  gap: 0.45rem;
 }
 
-.top-picks-card li {
+.top-pick-item {
+  border: 1px solid #e5e7eb;
+  border-radius: 9px;
+  padding: 0.45rem 0.5rem;
+  background: #ffffff;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  align-items: flex-start;
+}
+
+.top-pick-item-main {
   display: grid;
   gap: 0.08rem;
 }
 
-.top-picks-card li span {
+.top-pick-item-main span {
   font-size: 0.78rem;
   color: #4b5563;
 }
 
-.top-picks-card li small {
-  font-size: 0.76rem;
+.top-pick-item-main small {
+  font-size: 0.75rem;
   color: #374151;
+}
+
+.top-pick-prob {
+  border: 1px solid #d1fae5;
+  background: #ecfdf5;
+  color: #065f46;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.15rem 0.45rem;
+  white-space: nowrap;
 }
 
 .history-table-wrap {
@@ -773,23 +813,104 @@ body {
   border-radius: 10px;
   padding: 0.75rem;
   display: grid;
-  gap: 0.35rem;
+  gap: 0.55rem;
+}
+
+.runs-projection-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.runs-lean-chip {
+  border-radius: 999px;
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 0.76rem;
+  padding: 0.2rem 0.55rem;
+  font-weight: 600;
+}
+
+.runs-lean-chip.over {
+  border-color: #86efac;
+  background: #dcfce7;
+  color: #166534;
+}
+
+.runs-lean-chip.under {
+  border-color: #fecaca;
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.runs-projection-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.runs-metric-card {
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 0.4rem 0.5rem;
+  display: grid;
+  gap: 0.1rem;
+}
+
+.runs-metric-card small {
+  font-size: 0.72rem;
+  color: #64748b;
+}
+
+.runs-metric-card strong {
+  font-size: 0.9rem;
+}
+
+.runs-team-split {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.runs-team-split span {
+  border: 1px solid #d1d5db;
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 0.18rem 0.55rem;
+  font-size: 0.78rem;
+  font-weight: 600;
 }
 
 .runs-projection-main {
   margin: 0;
-  font-size: 0.9rem;
+  font-size: 0.86rem;
+  color: #334155;
 }
 
 .runs-projection-reasons {
   display: grid;
-  gap: 0.2rem;
+  gap: 0.18rem;
 }
 
 .runs-projection-reasons p {
   margin: 0;
-  font-size: 0.84rem;
+  font-size: 0.82rem;
   color: #334155;
+  padding-left: 0.7rem;
+  position: relative;
+}
+
+.runs-projection-reasons p::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: #60a5fa;
+  position: absolute;
+  left: 0;
+  top: 0.42rem;
 }
 
 .pitchers-row {
@@ -1264,5 +1385,10 @@ body {
 
   .top-picks-grid {
     grid-template-columns: 1fr;
+  }
+
+  .top-pick-item {
+    flex-direction: column;
+    gap: 0.28rem;
   }
 }

@@ -29,6 +29,7 @@ const teamActivePitchersCache = new Map();
 const teamRecentGamesCache = new Map();
 const gameBullpenUsageCache = new Map();
 const gameScoreSummaryCache = new Map();
+const gameTotalsOddsCache = new Map();
 const pitcherStrikeoutLineCache = new Map();
 let backendAccessToken = "";
 
@@ -498,18 +499,43 @@ function normalizeBackendLinesMap(linesByPitcherId) {
   }, {});
 }
 
+function normalizeBackendTotalsMap(totalsByGamePk) {
+  if (!totalsByGamePk || typeof totalsByGamePk !== "object") {
+    return {};
+  }
+  return Object.entries(totalsByGamePk).reduce((acc, [gamePk, node]) => {
+    const normalizedGamePk = Number(gamePk);
+    if (!normalizedGamePk || !node) {
+      return acc;
+    }
+    const line = typeof node?.line === "number" ? node.line : Number(node?.line);
+    if (!Number.isFinite(line)) {
+      return acc;
+    }
+    acc[normalizedGamePk] = {
+      line,
+      overPrice: node?.overPrice ?? null,
+      underPrice: node?.underPrice ?? null,
+      sportsbookKey: node?.sportsbookKey ?? "sportsbook",
+      sportsbookTitle: node?.sportsbookTitle ?? node?.sportsbookKey ?? "Sportsbook",
+      updatedAt: node?.updatedAt ?? Date.now()
+    };
+    return acc;
+  }, {});
+}
+
 export async function fetchPitcherStrikeoutLinesByGames(
   games,
   { preferredBookmakerKey = "draftkings", regions = "us" } = {}
 ) {
   try {
     if (!Array.isArray(games) || !games.length) {
-      return {};
+      return { linesByPitcherId: {}, totalsByGamePk: {} };
     }
 
     const upcomingGames = games.filter((game) => !hasGameStarted(game));
     if (!upcomingGames.length) {
-      return {};
+      return { linesByPitcherId: {}, totalsByGamePk: {} };
     }
 
     const cacheKey = `${preferredBookmakerKey}-${regions}-${upcomingGames
@@ -518,7 +544,14 @@ export async function fetchPitcherStrikeoutLinesByGames(
       .join(",")}`;
     const cached = getCachedOddsLines(cacheKey);
     if (cached) {
-      return cached;
+      const totalsByGamePk = Object.fromEntries(
+        upcomingGames
+          .map((game) => Number(game?.gamePk || 0))
+          .filter(Boolean)
+          .map((gamePk) => [gamePk, gameTotalsOddsCache.get(gamePk)])
+          .filter(([, total]) => Boolean(total))
+      );
+      return { linesByPitcherId: cached, totalsByGamePk };
     }
 
     const payload = await fetchBackendOddsJson("/odds/lines/by-games", {
@@ -528,11 +561,15 @@ export async function fetchPitcherStrikeoutLinesByGames(
       forceRefresh: false
     });
     const linesByPitcherId = normalizeBackendLinesMap(payload?.linesByPitcherId);
+    const totalsByGamePk = normalizeBackendTotalsMap(payload?.totalsByGamePk);
+    Object.entries(totalsByGamePk).forEach(([gamePk, node]) => {
+      gameTotalsOddsCache.set(Number(gamePk), node);
+    });
 
     setCachedOddsLines(cacheKey, linesByPitcherId);
-    return linesByPitcherId;
+    return { linesByPitcherId, totalsByGamePk };
   } catch (error) {
-    return {};
+    return { linesByPitcherId: {}, totalsByGamePk: {} };
   }
 }
 
@@ -560,7 +597,12 @@ export async function fetchPitcherStrikeoutLinesForGame(
     if (!forceRefresh) {
       const cached = getCachedOddsLines(cacheKey);
       if (cached) {
-        return { linesByPitcherId: cached, debug };
+        const totalsByGamePk = {};
+        const gamePk = Number(game?.gamePk || 0);
+        if (gamePk && gameTotalsOddsCache.has(gamePk)) {
+          totalsByGamePk[gamePk] = gameTotalsOddsCache.get(gamePk);
+        }
+        return { linesByPitcherId: cached, totalsByGamePk, debug };
       }
     } else {
       invalidateOddsCacheForGame(game?.gamePk);
@@ -574,6 +616,10 @@ export async function fetchPitcherStrikeoutLinesForGame(
       forceRefresh
     });
     const linesByPitcherId = normalizeBackendLinesMap(payload?.linesByPitcherId);
+    const totalsByGamePk = normalizeBackendTotalsMap(payload?.totalsByGamePk);
+    Object.entries(totalsByGamePk).forEach(([gamePk, node]) => {
+      gameTotalsOddsCache.set(Number(gamePk), node);
+    });
 
     if (Object.keys(linesByPitcherId).length) {
       const firstPitcher = Object.values(linesByPitcherId)[0];
@@ -584,10 +630,10 @@ export async function fetchPitcherStrikeoutLinesForGame(
       pitcherStrikeoutLineCache.delete(cacheKey);
     }
 
-    return { linesByPitcherId, debug };
+    return { linesByPitcherId, totalsByGamePk, debug };
   } catch (error) {
     debug.error = error instanceof Error ? error.message : "Unexpected error";
-    return { linesByPitcherId: {}, debug };
+    return { linesByPitcherId: {}, totalsByGamePk: {}, debug };
   }
 }
 

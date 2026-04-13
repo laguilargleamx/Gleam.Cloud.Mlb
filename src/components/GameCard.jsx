@@ -293,6 +293,17 @@ function formatBullpenPitcherLine(pitcher) {
   return `${eraLabel} · ${probability}% · Descanso ${rest}d · Ult ${pitches} p · ${status}`;
 }
 
+function getRunsProjectionTone(lean) {
+  const normalized = `${lean || ""}`.toLowerCase();
+  if (normalized === "over") {
+    return "over";
+  }
+  if (normalized === "under") {
+    return "under";
+  }
+  return "neutral";
+}
+
 function normalizeEraValue(value, fallback = 4.15) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) {
@@ -355,7 +366,8 @@ function buildRunProjectionModel({
   homeStarterEra,
   awayBullpen,
   homeBullpen,
-  weather
+  weather,
+  sportsbookTotalLine
 }) {
   if (!lineups?.away?.length || !lineups?.home?.length) {
     return null;
@@ -401,9 +413,16 @@ function buildRunProjectionModel({
     8.4
   );
   const totalRuns = awayRuns + homeRuns;
-  const baselineLine = 8.5;
-  const lean = totalRuns >= baselineLine + 0.2 ? "Over" : totalRuns <= baselineLine - 0.2 ? "Under" : "Nula";
-  const edge = Math.abs(totalRuns - baselineLine);
+  const baselineLine = Number(sportsbookTotalLine);
+  const hasSportsbookLine = Number.isFinite(baselineLine) && baselineLine > 0;
+  const lean = hasSportsbookLine
+    ? totalRuns >= baselineLine + 0.2
+      ? "Over"
+      : totalRuns <= baselineLine - 0.2
+        ? "Under"
+        : "Nula"
+    : "Nula";
+  const edge = hasSportsbookLine ? Math.abs(totalRuns - baselineLine) : 0;
   const confidence = lean === "Nula" ? 0.5 : clampProbability(0.51 + edge * 0.09, 0.51, 0.68);
   const awayAttackLevel =
     awayOffense.offenseFactor >= 1.06
@@ -424,11 +443,21 @@ function buildRunProjectionModel({
       : weatherFactor <= 0.97
         ? "puede bajar un poco las carreras"
         : "neutral";
-  const leanLabel =
-    lean === "Over" ? "Nos inclinamos al Over" : lean === "Under" ? "Nos inclinamos al Under" : "Sin ventaja clara";
-  const plainExplanation = `Proyectamos un juego de ${totalRuns.toFixed(1)} carreras. ${leanLabel} con confianza ${Math.round(confidence * 100)}%.`;
+  const leanLabel = !hasSportsbookLine
+    ? "Sin linea del sportsbook para comparar"
+    : lean === "Over"
+      ? "Nos inclinamos al Over"
+      : lean === "Under"
+        ? "Nos inclinamos al Under"
+        : "Sin ventaja clara";
+  const plainExplanation = hasSportsbookLine
+    ? `Proyectamos un juego de ${totalRuns.toFixed(1)} carreras. ${leanLabel} con confianza ${Math.round(confidence * 100)}%.`
+    : `Proyectamos ${totalRuns.toFixed(1)} carreras, pero no hay linea del sportsbook para evaluar Over/Under.`;
 
   const reasons = [
+    hasSportsbookLine
+      ? `Comparamos nuestra proyeccion (${totalRuns.toFixed(1)}) contra la linea de sportsbook (${baselineLine.toFixed(1)}).`
+      : "No hay linea de sportsbook disponible para total de carreras en este juego.",
     `La visita llega con ataque ${awayAttackLevel}, y el local con ataque ${homeAttackLevel}.`,
     `Los abridores proyectan ${normalizeEraValue(homeStarterEra).toFixed(2)} y ${normalizeEraValue(awayStarterEra).toFixed(2)} de ERA.`,
     `El bullpen probable pinta en ${awayBullpenEra.toFixed(2)} y ${homeBullpenEra.toFixed(2)} de ERA para cerrar el juego.`,
@@ -444,6 +473,7 @@ function buildRunProjectionModel({
     homeRuns,
     totalRuns,
     baselineLine,
+    hasSportsbookLine,
     lean,
     leanLabel,
     confidence,
@@ -472,7 +502,10 @@ function buildRunsHistoryEntries(game, model) {
   const homeAbbr = getTeamAbbreviation(homeTeam);
   const eventLabel = `${awayAbbr} vs ${homeAbbr}`;
   const createdAt = Date.now();
-  const gameTotalLine = Number(model?.baselineLine || 8.5);
+  const gameTotalLine = Number(model?.baselineLine);
+  if (!Number.isFinite(gameTotalLine) || !model?.hasSportsbookLine) {
+    return [];
+  }
   const gameTotalLean = `${model?.lean || "Nula"}`;
   const gameTotalProbability = Number(model?.confidence || 0.5);
   const entries = [];
@@ -1062,6 +1095,7 @@ export default function GameCard({
   pitcherStrikeoutValueById,
   pitcherHandednessById,
   gameWeatherByGamePk,
+  gameTotalsByGamePk,
   oddsLoading,
   onRefreshOddsForGame,
   onUpsertHistoryEntries
@@ -1335,7 +1369,8 @@ export default function GameCard({
       homeStarterEra: homeStarterEraValue,
       awayBullpen: bullpenPayload?.away,
       homeBullpen: bullpenPayload?.home,
-      weather: gameWeatherByGamePk?.[game?.gamePk]
+      weather: gameWeatherByGamePk?.[game?.gamePk],
+      sportsbookTotalLine: gameTotalsByGamePk?.[game?.gamePk]?.line
     });
     if (!model) {
       setRunsProjectionError("No se pudo calcular proyeccion de carreras para este juego.");
@@ -1488,26 +1523,44 @@ export default function GameCard({
           {runsProjectionError ? <p className="error">{runsProjectionError}</p> : null}
           {!runsProjectionError && runsProjection ? (
             <>
-              <p className="runs-projection-main">
-                <strong>Total proyectado:</strong> {runsProjection.totalRuns.toFixed(1)} carreras ·{" "}
-                <strong>
+              <div className="runs-projection-top">
+                <strong>Proyeccion O/U</strong>
+                <span
+                  className={`runs-lean-chip ${getRunsProjectionTone(runsProjection.lean)}`}
+                >
+                  {runsProjection.leanLabel}
+                </span>
+              </div>
+              <div className="runs-projection-metrics">
+                <div className="runs-metric-card">
+                  <small>Total proyectado</small>
+                  <strong>{runsProjection.totalRuns.toFixed(1)} carreras</strong>
+                </div>
+                <div className="runs-metric-card">
+                  <small>Linea sportsbook</small>
+                  <strong>
+                    {runsProjection.hasSportsbookLine
+                      ? runsProjection.baselineLine.toFixed(1)
+                      : "No disponible"}
+                  </strong>
+                </div>
+                <div className="runs-metric-card">
+                  <small>Confianza</small>
+                  <strong>{Math.round(runsProjection.confidence * 100)}%</strong>
+                </div>
+              </div>
+              <div className="runs-team-split">
+                <span>
                   {getTeamAbbreviation(game.teams.away.team)} {runsProjection.awayRuns.toFixed(1)}
-                </strong>{" "}
-                vs{" "}
-                <strong>
+                </span>
+                <span>
                   {getTeamAbbreviation(game.teams.home.team)} {runsProjection.homeRuns.toFixed(1)}
-                </strong>
-              </p>
-              <p className="runs-projection-main">
-                <strong>Recomendacion rapida:</strong> {runsProjection.leanLabel} · Confianza{" "}
-                {Math.round(runsProjection.confidence * 100)}%
-              </p>
-              <p className="runs-projection-main">
-                {runsProjection.plainExplanation} (Referencia interna: {runsProjection.baselineLine.toFixed(1)}).
-              </p>
+                </span>
+              </div>
+              <p className="runs-projection-main">{runsProjection.plainExplanation}</p>
               <div className="runs-projection-reasons">
                 {runsProjection.reasons.map((reason, index) => (
-                  <p key={`${game.gamePk}-run-reason-${index}`}>- {reason}</p>
+                  <p key={`${game.gamePk}-run-reason-${index}`}>{reason}</p>
                 ))}
               </div>
             </>

@@ -73,6 +73,7 @@ app.add_middleware(
 bearer_scheme = HTTPBearer(auto_error=False)
 weather_by_game_cache: dict[str, dict[str, Any]] = {}
 venue_context_cache: dict[int, dict[str, Any]] = {}
+game_totals_cache: dict[str, dict[str, Any]] = {}
 
 
 def utc_now() -> datetime:
@@ -583,6 +584,43 @@ def extract_pitcher_line(bookmaker: dict[str, Any], pitcher_name: str | None) ->
     }
 
 
+def extract_game_total_line(bookmaker: dict[str, Any]) -> dict[str, Any] | None:
+    markets = bookmaker.get("markets") or []
+    totals_market = next((m for m in markets if m.get("key") == "totals"), None)
+    if not totals_market:
+        return None
+    outcomes = totals_market.get("outcomes") or []
+    over_outcome = next((o for o in outcomes if str(o.get("name", "")).lower() == "over"), None)
+    under_outcome = next((o for o in outcomes if str(o.get("name", "")).lower() == "under"), None)
+    fallback = next((o for o in outcomes if isinstance(o.get("point"), (int, float))), None)
+    selected = over_outcome or under_outcome or fallback
+    line = selected.get("point") if isinstance(selected, dict) else None
+    if not isinstance(line, (int, float)):
+        return None
+    return {
+        "line": float(line),
+        "over_price": over_outcome.get("price") if isinstance(over_outcome, dict) else None,
+        "under_price": under_outcome.get("price") if isinstance(under_outcome, dict) else None,
+    }
+
+
+def get_cached_game_total(game_pk: int) -> dict[str, Any] | None:
+    cache_key = str(game_pk)
+    cached = game_totals_cache.get(cache_key)
+    now = utc_now()
+    if (
+        cached
+        and isinstance(cached.get("expiresAt"), datetime)
+        and cached["expiresAt"] > now
+    ):
+        return cached.get("value")
+    return None
+
+
+def set_cached_game_total(game_pk: int, value: dict[str, Any], expires_at: datetime) -> None:
+    game_totals_cache[str(game_pk)] = {"expiresAt": expires_at, "value": value}
+
+
 def create_tables_if_needed() -> None:
     odds_sql = """
     CREATE TABLE IF NOT EXISTS pitcher_odds_lines (
@@ -898,10 +936,10 @@ async def resolve_lines_for_game(
     regions: str,
     force_refresh: bool,
     events_cache: list[dict[str, Any]] | None,
-) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]] | None]:
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any] | None, list[dict[str, Any]] | None]:
     game_pk = int(game.get("gamePk") or 0)
     if not game_pk:
-        return {}, events_cache
+        return {}, None, events_cache
 
     away_pitcher = ((game.get("teams") or {}).get("away") or {}).get("probablePitcher") or {}
     home_pitcher = ((game.get("teams") or {}).get("home") or {}).get("probablePitcher") or {}
@@ -911,8 +949,13 @@ async def resolve_lines_for_game(
 
     if not force_refresh:
         cached = load_cached_game_lines(conn, game_pk, target_pitcher_ids, preferred_bookmaker_key, regions)
-        if len(cached) == len(target_pitcher_ids) and len(target_pitcher_ids) > 0:
-            return cached, events_cache
+        cached_total = get_cached_game_total(game_pk)
+        if (
+            len(cached) == len(target_pitcher_ids)
+            and len(target_pitcher_ids) > 0
+            and cached_total is not None
+        ):
+            return cached, cached_total, events_cache
 
     if events_cache is None:
         raw_events = await fetch_odds_json("/sports/baseball_mlb/events", {})
@@ -920,13 +963,13 @@ async def resolve_lines_for_game(
 
     event = find_matching_event(game, events_cache)
     if not event or not event.get("id"):
-        return {}, events_cache
+        return {}, None, events_cache
 
     odds_payload = await fetch_odds_json(
         f"/sports/baseball_mlb/events/{event['id']}/odds",
         {
             "regions": regions,
-            "markets": "pitcher_strikeouts",
+            "markets": "pitcher_strikeouts,totals",
             "oddsFormat": "american",
         },
     )
@@ -934,7 +977,7 @@ async def resolve_lines_for_game(
         "bookmakers", []
     )
     if not bookmakers:
-        return {}, events_cache
+        return {}, None, events_cache
 
     bookmaker = next((b for b in bookmakers if b.get("key") == preferred_bookmaker_key), bookmakers[0])
     sportsbook_key = bookmaker.get("key") or preferred_bookmaker_key
@@ -943,6 +986,18 @@ async def resolve_lines_for_game(
     now = utc_now()
     expires_at = now + timedelta(minutes=ODDS_CACHE_TTL_MINUTES)
     source = "user_refresh" if force_refresh else "auto"
+    extracted_total = extract_game_total_line(bookmaker)
+    totals_node = None
+    if extracted_total:
+        totals_node = {
+            "line": float(extracted_total["line"]),
+            "overPrice": extracted_total.get("over_price"),
+            "underPrice": extracted_total.get("under_price"),
+            "sportsbookKey": sportsbook_key,
+            "sportsbookTitle": sportsbook_title,
+            "updatedAt": to_unix_ms(now),
+        }
+        set_cached_game_total(game_pk, totals_node, expires_at)
 
     lines_by_pitcher_id: dict[int, dict[str, Any]] = {}
     for pitcher in [away_pitcher, home_pitcher]:
@@ -978,7 +1033,7 @@ async def resolve_lines_for_game(
             "updatedAt": to_unix_ms(now),
         }
 
-    return lines_by_pitcher_id, events_cache
+    return lines_by_pitcher_id, totals_node, events_cache
 
 
 @app.on_event("startup")
@@ -1106,12 +1161,15 @@ async def weather_by_games(
         for game in req.games:
             if not isinstance(game, dict):
                 continue
-            game_pk = int(game.get("gamePk") or 0)
-            if not game_pk:
+            try:
+                game_pk = int(game.get("gamePk") or 0)
+                if not game_pk:
+                    continue
+                weather = await resolve_game_weather(game, req.forceRefresh)
+                if weather:
+                    weather_payload[str(game_pk)] = weather
+            except Exception:
                 continue
-            weather = await resolve_game_weather(game, req.forceRefresh)
-            if weather:
-                weather_payload[str(game_pk)] = weather
     except HTTPException:
         raise
     except Exception as exc:
@@ -1125,9 +1183,10 @@ async def odds_lines_by_games(
     _auth_payload: dict[str, Any] = Depends(require_authenticated_user),
 ) -> dict[str, Any]:
     if not req.games:
-        return {"linesByPitcherId": {}}
+        return {"linesByPitcherId": {}, "totalsByGamePk": {}}
 
     lines_by_pitcher_id: dict[str, dict[str, Any]] = {}
+    totals_by_game_pk: dict[str, dict[str, Any]] = {}
     events_cache: list[dict[str, Any]] | None = None
 
     try:
@@ -1135,19 +1194,25 @@ async def odds_lines_by_games(
             for game in req.games:
                 if has_game_started(game):
                     continue
-                game_lines, events_cache = await resolve_lines_for_game(
-                    conn,
-                    game=game,
-                    preferred_bookmaker_key=req.preferredBookmakerKey,
-                    regions=req.regions,
-                    force_refresh=req.forceRefresh,
-                    events_cache=events_cache,
-                )
-                for pitcher_id, line in game_lines.items():
-                    lines_by_pitcher_id[str(pitcher_id)] = line
+                try:
+                    game_lines, totals_node, events_cache = await resolve_lines_for_game(
+                        conn,
+                        game=game,
+                        preferred_bookmaker_key=req.preferredBookmakerKey,
+                        regions=req.regions,
+                        force_refresh=req.forceRefresh,
+                        events_cache=events_cache,
+                    )
+                    for pitcher_id, line in game_lines.items():
+                        lines_by_pitcher_id[str(pitcher_id)] = line
+                    game_pk = int(game.get("gamePk") or 0)
+                    if game_pk and totals_node:
+                        totals_by_game_pk[str(game_pk)] = totals_node
+                except Exception:
+                    continue
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unexpected backend error: {exc}") from exc
 
-    return {"linesByPitcherId": lines_by_pitcher_id}
+    return {"linesByPitcherId": lines_by_pitcher_id, "totalsByGamePk": totals_by_game_pk}

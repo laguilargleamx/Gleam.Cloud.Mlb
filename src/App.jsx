@@ -374,7 +374,7 @@ function normalizeHistoryEntries(entries) {
   return (Array.isArray(entries) ? entries : [])
     .map((entry) => ({
       entryKey: `${entry?.entryKey || ""}`,
-      pickDomain: `${entry?.pickDomain || "strikeouts"}`,
+      pickDomain: normalizeLegacyPickDomain(entry?.pickDomain, entry?.marketLabel, entry?.pitcherName),
       gamePk: Number(entry?.gamePk || 0),
       gameDate: `${entry?.gameDate || ""}`,
       eventLabel: `${entry?.eventLabel || ""}`,
@@ -474,12 +474,77 @@ function estimateOnBaseProbability(stats, streaks, hitProbability, vsPitcherStat
   );
 }
 
+function normalizeEraValue(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+  return numeric;
+}
+
+function computeLineupOffenseFactor(players, statsByPlayerId) {
+  const rows = (players ?? [])
+    .map((player) => statsByPlayerId?.[player?.playerId])
+    .filter(Boolean);
+  if (!rows.length) {
+    return 1;
+  }
+  let obpSum = 0;
+  let opsSum = 0;
+  for (const stat of rows) {
+    const obp = Number(stat?.obp);
+    const ops = Number(stat?.ops);
+    obpSum += Number.isFinite(obp) && obp > 0 ? obp : 0.315;
+    opsSum += Number.isFinite(ops) && ops > 0 ? ops : 0.72;
+  }
+  const avgObp = obpSum / rows.length;
+  const avgOps = opsSum / rows.length;
+  const factor = 1 + (avgObp - 0.315) * 1.45 + (avgOps - 0.72) * 0.62;
+  return clampProbability(factor, 0.84, 1.2);
+}
+
 function formatPercent(probability) {
   const numeric = Number(probability);
   if (!Number.isFinite(numeric)) {
     return "--";
   }
   return `${Math.round(numeric * 100)}%`;
+}
+
+function normalizeLegacyPickDomain(rawDomain, marketLabel, pitcherName) {
+  const domain = `${rawDomain || "strikeouts"}`.toLowerCase().trim();
+  if (domain && domain !== "strikeouts") {
+    return domain;
+  }
+  const market = `${marketLabel || ""}`.toLowerCase();
+  const player = `${pitcherName || ""}`.toLowerCase();
+  if (market.includes("total juego o/u") || player.includes("total juego")) {
+    return "game_total";
+  }
+  if (market.includes("total ") && market.includes(" o/u ")) {
+    return "team_total";
+  }
+  return "strikeouts";
+}
+
+function formatHistoryPickLabel(entry) {
+  const domain = `${entry?.pickDomain || "strikeouts"}`.toLowerCase();
+  if (domain === "game_total" || domain === "team_total") {
+    return entry?.marketLabel || `Total O/U ${Number(entry?.offeredLine || 0).toFixed(1)}`;
+  }
+  if (domain === "strikeouts") {
+    return entry?.marketLabel || `${Number(entry?.offeredLine).toFixed(1)} K`;
+  }
+  return entry?.marketLabel || `${entry?.recommendation || "-"}`;
+}
+
+function formatHistoryRecommendationLabel(entry) {
+  const probability = (Number(entry?.probability || 0) * 100).toFixed(0);
+  const domain = `${entry?.pickDomain || "strikeouts"}`.toLowerCase();
+  if (domain === "game_total" || domain === "team_total") {
+    return `${entry?.recommendation} vs ${Number(entry?.offeredLine || 0).toFixed(1)} (${probability}%)`;
+  }
+  return `${entry?.recommendation} (${probability}%)`;
 }
 
 function getTodayIsoDate() {
@@ -790,6 +855,7 @@ export default function App() {
   const [pitcherStrikeoutValueById, setPitcherStrikeoutValueById] = useState({});
   const [pitcherHandednessById, setPitcherHandednessById] = useState({});
   const [gameWeatherByGamePk, setGameWeatherByGamePk] = useState({});
+  const [gameTotalsByGamePk, setGameTotalsByGamePk] = useState({});
   const [oddsLoading, setOddsLoading] = useState(false);
   const [gamesViewMode, setGamesViewMode] = useState("all");
   const [selectedMatchFilter, setSelectedMatchFilter] = useState("all");
@@ -807,7 +873,8 @@ export default function App() {
   const [topPicks, setTopPicks] = useState({
     strikeouts: [],
     hits: [],
-    onBase: []
+    onBase: [],
+    totals: []
   });
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [historySyncLoading, setHistorySyncLoading] = useState(false);
@@ -1114,11 +1181,77 @@ export default function App() {
         const topStrikeouts = topDomain(strikeoutCandidates);
         const topHits = topDomain(hitCandidates);
         const topOnBase = topDomain(onBaseCandidates);
+        const totalsCandidates = [];
+        for (const [game, lineups] of lineupResults) {
+          const gamePk = Number(game?.gamePk || 0);
+          if (!gamePk || !lineups?.away?.length || !lineups?.home?.length) {
+            continue;
+          }
+          const totalLine = Number(gameTotalsByGamePk?.[gamePk]?.line);
+          if (!Number.isFinite(totalLine) || totalLine <= 0) {
+            continue;
+          }
+          const awayPitcherEra = normalizeEraValue(
+            pitcherErasById?.[game?.teams?.away?.probablePitcher?.id]
+          );
+          const homePitcherEra = normalizeEraValue(
+            pitcherErasById?.[game?.teams?.home?.probablePitcher?.id]
+          );
+          if (!awayPitcherEra || !homePitcherEra) {
+            continue;
+          }
+          const awayOffense = computeLineupOffenseFactor(lineups.away, statsByPlayerId);
+          const homeOffense = computeLineupOffenseFactor(lineups.home, statsByPlayerId);
+          const awayStarterFactor = clampProbability(1 + (homePitcherEra - 4) * 0.085, 0.8, 1.25);
+          const homeStarterFactor = clampProbability(1 + (awayPitcherEra - 4) * 0.085, 0.8, 1.25);
+          const weatherNode = gameWeatherByGamePk?.[gamePk];
+          const weatherTemp = Number(weatherNode?.temperatureC);
+          const weatherWind = Number(weatherNode?.windSpeedKph);
+          const weatherRain = Number(weatherNode?.precipitationProbability);
+          const isIndoor = Boolean(weatherNode?.isIndoorLikely);
+          let weatherFactor = 1;
+          if (!isIndoor) {
+            if (Number.isFinite(weatherTemp)) {
+              weatherFactor += clampProbability((weatherTemp - 20) * 0.0032, -0.04, 0.05);
+            }
+            if (Number.isFinite(weatherWind)) {
+              weatherFactor += clampProbability((weatherWind - 14) * 0.0023, -0.015, 0.035);
+            }
+            if (Number.isFinite(weatherRain) && weatherRain >= 55) {
+              weatherFactor -= 0.02;
+            }
+          }
+          weatherFactor = clampProbability(weatherFactor, 0.9, 1.12);
+          const projectedTotal =
+            8.5 *
+            ((awayOffense * awayStarterFactor + homeOffense * homeStarterFactor) / 2) *
+            weatherFactor;
+          const lean = projectedTotal >= totalLine + 0.2 ? "Over" : projectedTotal <= totalLine - 0.2 ? "Under" : "Nula";
+          if (lean === "Nula") {
+            continue;
+          }
+          const edge = Math.abs(projectedTotal - totalLine);
+          const probability = clampProbability(0.51 + edge * 0.09, 0.51, 0.68);
+          const awayTeam = game?.teams?.away?.team;
+          const homeTeam = game?.teams?.home?.team;
+          totalsCandidates.push({
+            key: `totals-${gamePk}`,
+            gamePk,
+            gameDate: `${game?.officialDate || `${game?.gameDate || ""}`.slice(0, 10)}`,
+            playerId: 999001,
+            eventLabel: `${getTeamAbbreviation(awayTeam)} vs ${getTeamAbbreviation(homeTeam)}`,
+            playerName: "Total Juego",
+            marketLabel: `${lean} ${totalLine.toFixed(1)} (Proy ${projectedTotal.toFixed(1)})`,
+            probability
+          });
+        }
+        const topTotals = topDomain(totalsCandidates);
         if (!ignore) {
           setTopPicks({
             strikeouts: topStrikeouts,
             hits: topHits,
-            onBase: topOnBase
+            onBase: topOnBase,
+            totals: topTotals
           });
 
           const batterEntries = [
@@ -1194,7 +1327,10 @@ export default function App() {
     selectedDate,
     pitcherStrikeoutLinesById,
     pitcherStrikeoutValueById,
+    pitcherErasById,
     pitcherHandednessById,
+    gameWeatherByGamePk,
+    gameTotalsByGamePk,
     recommendationHistory
   ]);
 
@@ -1211,6 +1347,7 @@ export default function App() {
       setPitcherStrikeoutValueById(snapshot?.pitcherStrikeoutValueById ?? {});
       setPitcherHandednessById(snapshot?.pitcherHandednessById ?? {});
       setGameWeatherByGamePk(snapshot?.gameWeatherByGamePk ?? {});
+      setGameTotalsByGamePk(snapshot?.gameTotalsByGamePk ?? {});
     }
 
     async function loadGames() {
@@ -1238,7 +1375,7 @@ export default function App() {
           game.teams?.home?.probablePitcher?.id
         ]);
         const season = selectedDate.split("-")[0];
-        const [erasMap, strikeoutsPerGameMap, strikeoutLinesMap, handednessMap, weatherByGamePk] =
+        const [erasMap, strikeoutsPerGameMap, oddsSnapshot, handednessMap, weatherByGamePk] =
           await Promise.all([
             fetchPitcherErasByIds(pitcherIds, season),
             fetchPitcherStrikeoutsPerGameByIds(pitcherIds, season),
@@ -1246,6 +1383,8 @@ export default function App() {
             fetchPitcherHandednessByIds(pitcherIds),
             fetchGameWeatherByGames(fetchedGames, { forceRefresh })
           ]);
+        const strikeoutLinesMap = oddsSnapshot?.linesByPitcherId ?? {};
+        const totalsByGamePk = oddsSnapshot?.totalsByGamePk ?? {};
         const strikeoutValueMap = await evaluatePitcherStrikeoutValueByGames(
           fetchedGames,
           strikeoutLinesMap,
@@ -1260,7 +1399,8 @@ export default function App() {
             pitcherStrikeoutLinesById: strikeoutLinesMap,
             pitcherStrikeoutValueById: strikeoutValueMap,
             pitcherHandednessById: handednessMap,
-            gameWeatherByGamePk: weatherByGamePk
+            gameWeatherByGamePk: weatherByGamePk,
+            gameTotalsByGamePk: totalsByGamePk
           };
           applyLoadedData(nextSnapshot);
           writeAppDataCache(selectedDate, nextSnapshot);
@@ -1286,6 +1426,7 @@ export default function App() {
           setPitcherStrikeoutValueById({});
           setPitcherHandednessById({});
           setGameWeatherByGamePk({});
+          setGameTotalsByGamePk({});
           setOddsLoading(false);
         }
       } finally {
@@ -1373,6 +1514,10 @@ export default function App() {
         delete nextLinesByPitcherId[homePitcherId];
       }
       Object.assign(nextLinesByPitcherId, result.linesByPitcherId);
+      const nextTotalsByGamePk = {
+        ...gameTotalsByGamePk,
+        ...(result?.totalsByGamePk ?? {})
+      };
 
       const season = selectedDate.split("-")[0];
       const refreshedValueMap = await evaluatePitcherStrikeoutValueByGames(
@@ -1391,6 +1536,7 @@ export default function App() {
 
       setPitcherStrikeoutLinesById(nextLinesByPitcherId);
       setPitcherStrikeoutValueById(nextStrikeoutValueById);
+      setGameTotalsByGamePk(nextTotalsByGamePk);
       writeAppDataCache(selectedDate, {
         games,
         pitcherErasById,
@@ -1398,7 +1544,8 @@ export default function App() {
         pitcherStrikeoutLinesById: nextLinesByPitcherId,
         pitcherStrikeoutValueById: nextStrikeoutValueById,
         pitcherHandednessById,
-        gameWeatherByGamePk
+        gameWeatherByGamePk,
+        gameTotalsByGamePk: nextTotalsByGamePk
       });
 
       return result.debug;
@@ -1513,7 +1660,15 @@ export default function App() {
       );
     }
     return selectedHistoryEntries.filter(
-      (entry) => `${entry?.pickDomain || "strikeouts"}`.toLowerCase() === "strikeouts"
+      (entry) => {
+        const domain = `${entry?.pickDomain || "strikeouts"}`.toLowerCase();
+        if (domain !== "strikeouts") {
+          return false;
+        }
+        const market = `${entry?.marketLabel || ""}`.toLowerCase();
+        const player = `${entry?.pitcherName || ""}`.toLowerCase();
+        return !market.includes("total") && !player.includes("total juego");
+      }
     );
   }, [selectedHistoryEntries, historyPickGroup]);
 
@@ -1666,33 +1821,38 @@ export default function App() {
             <strong>Top Picks del dia ({selectedDate})</strong>
           </div>
           <p className="history-summary">
-            2 recomendaciones por dominio (Strikeouts, Hits y Embasarse) en todos los juegos del dia.
+            2 recomendaciones por dominio (Strikeouts, Hits, Embasarse y Totales O/U) en todos los juegos del dia.
             {topPicksLoading ? " · Calculando..." : ""}
           </p>
           {topPicksError ? <p className="error">{topPicksError}</p> : null}
           {!topPicksLoading ? (
             <div className="top-picks-grid">
               {[
-                { key: "strikeouts", title: "Strikeouts (Over/Under)", rows: topPicks.strikeouts },
-                { key: "hits", title: "Hits", rows: topPicks.hits },
-                { key: "onBase", title: "Embasarse", rows: topPicks.onBase }
+                { key: "strikeouts", title: "Strikeouts (Over/Under)", rows: topPicks.strikeouts, icon: "K" },
+                { key: "hits", title: "Hits", rows: topPicks.hits, icon: "H" },
+                { key: "onBase", title: "Embasarse", rows: topPicks.onBase, icon: "OB" },
+                { key: "totals", title: "Totales O/U", rows: topPicks.totals, icon: "O/U" }
               ].map((domain) => (
-                <article key={domain.key} className="top-picks-card">
-                  <h3>{domain.title}</h3>
+                <article key={domain.key} className={`top-picks-card domain-${domain.key}`}>
+                  <div className="top-picks-card-head">
+                    <h3>{domain.title}</h3>
+                    <span className="top-picks-domain-icon">{domain.icon}</span>
+                  </div>
                   {!domain.rows.length ? (
                     <p>Sin suficiente data para este dominio.</p>
                   ) : (
-                    <ol>
+                    <div className="top-picks-list">
                       {domain.rows.map((row) => (
-                        <li key={row.key}>
-                          <strong>{row.playerName}</strong>
-                          <span>{row.eventLabel}</span>
-                          <small>
-                            {row.marketLabel} · Prob. {formatPercent(row.probability)}
-                          </small>
-                        </li>
+                        <article key={row.key} className="top-pick-item">
+                          <div className="top-pick-item-main">
+                            <strong>{row.playerName}</strong>
+                            <span>{row.eventLabel}</span>
+                            <small>{row.marketLabel}</small>
+                          </div>
+                          <span className="top-pick-prob">Prob. {formatPercent(row.probability)}</span>
+                        </article>
                       ))}
-                    </ol>
+                    </div>
                   )}
                 </article>
               ))}
@@ -1783,13 +1943,10 @@ export default function App() {
                         <td>{entry.eventLabel}</td>
                         <td>{entry.pitcherName}</td>
                         <td>
-                          {entry.marketLabel ||
-                            (`${entry?.pickDomain || "strikeouts"}`.toLowerCase() === "strikeouts"
-                              ? `${Number(entry.offeredLine).toFixed(1)} K`
-                              : `${entry.recommendation}`)}
+                          {formatHistoryPickLabel(entry)}
                         </td>
                         <td>
-                          {entry.recommendation} ({(Number(entry.probability || 0) * 100).toFixed(0)}%)
+                          {formatHistoryRecommendationLabel(entry)}
                         </td>
                         <td>
                           {entry.actualStrikeouts === null || entry.actualStrikeouts === undefined ? "-" : `${entry.actualStrikeouts}`}
@@ -1854,6 +2011,7 @@ export default function App() {
           pitcherStrikeoutValueById={pitcherStrikeoutValueById}
           pitcherHandednessById={pitcherHandednessById}
           gameWeatherByGamePk={gameWeatherByGamePk}
+          gameTotalsByGamePk={gameTotalsByGamePk}
           oddsLoading={oddsLoading}
           onRefreshOddsForGame={handleRefreshOddsForGame}
           onUpsertHistoryEntries={handleUpsertHistoryEntries}
