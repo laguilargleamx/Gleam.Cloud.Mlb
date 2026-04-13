@@ -452,18 +452,22 @@ def create_tables_if_needed() -> None:
             cur.execute(odds_sql)
             cur.execute(revoked_tokens_sql)
             cur.execute(recommendation_history_sql)
-            cur.execute(
-                """
-                ALTER TABLE recommendation_history
-                ADD COLUMN IF NOT EXISTS pick_domain VARCHAR(24) NOT NULL DEFAULT 'strikeouts'
-                """
-            )
-            cur.execute(
-                """
-                ALTER TABLE recommendation_history
-                ADD COLUMN IF NOT EXISTS market_label VARCHAR(64) NULL
-                """
-            )
+            cur.execute("SHOW COLUMNS FROM recommendation_history LIKE %s", ("pick_domain",))
+            if not cur.fetchone():
+                cur.execute(
+                    """
+                    ALTER TABLE recommendation_history
+                    ADD COLUMN pick_domain VARCHAR(24) NOT NULL DEFAULT 'strikeouts'
+                    """
+                )
+            cur.execute("SHOW COLUMNS FROM recommendation_history LIKE %s", ("market_label",))
+            if not cur.fetchone():
+                cur.execute(
+                    """
+                    ALTER TABLE recommendation_history
+                    ADD COLUMN market_label VARCHAR(64) NULL
+                    """
+                )
 
 
 def load_cached_game_lines(
