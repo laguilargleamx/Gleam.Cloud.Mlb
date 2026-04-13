@@ -6,6 +6,7 @@ import {
   fetchPlayersHittingStatsByIds,
   fetchPlayersHittingStreaksByIds,
   fetchPlayersVsPitcherStatsByIds,
+  fetchBullpenProbablesForGame,
   getPitcherImageUrl,
   getTeamAbbreviation,
   getTeamLogoUrl
@@ -280,6 +281,264 @@ function formatGameWeatherLine(gameWeather) {
     return `Clima estimado: ${chunks.join(" | ")}`;
   }
   return "";
+}
+
+function formatBullpenPitcherLine(pitcher) {
+  const probability = Number(pitcher?.probability || 0);
+  const rest = Number(pitcher?.daysSinceLast || 0);
+  const pitches = Number(pitcher?.pitchesLast || 0);
+  const status = pitcher?.status || "disponible";
+  const era = Number(pitcher?.era);
+  const eraLabel = Number.isFinite(era) ? `ERA ${era.toFixed(2)}` : "ERA --";
+  return `${eraLabel} · ${probability}% · Descanso ${rest}d · Ult ${pitches} p · ${status}`;
+}
+
+function normalizeEraValue(value, fallback = 4.15) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
+  }
+  return numeric;
+}
+
+function computeBullpenWeightedEra(teamBullpen) {
+  const pitchers = teamBullpen?.pitchers ?? [];
+  if (!pitchers.length) {
+    return 4.1;
+  }
+  let weightedEra = 0;
+  let weightTotal = 0;
+  for (const pitcher of pitchers) {
+    const era = normalizeEraValue(pitcher?.era, 4.1);
+    const probability = Number(pitcher?.probability || 0);
+    const weight = Number.isFinite(probability) && probability > 0 ? probability : 10;
+    weightedEra += era * weight;
+    weightTotal += weight;
+  }
+  if (!weightTotal) {
+    return 4.1;
+  }
+  return weightedEra / weightTotal;
+}
+
+function computeLineupOffenseIndex(players, statsByPlayerId) {
+  const rows = (players ?? [])
+    .map((player) => statsByPlayerId?.[player?.playerId])
+    .filter(Boolean);
+  if (!rows.length) {
+    return {
+      offenseFactor: 1,
+      avgObp: 0.315,
+      avgOps: 0.72
+    };
+  }
+  let obpSum = 0;
+  let opsSum = 0;
+  for (const stat of rows) {
+    const obp = Number(stat?.obp);
+    const ops = Number(stat?.ops);
+    obpSum += Number.isFinite(obp) && obp > 0 ? obp : 0.315;
+    opsSum += Number.isFinite(ops) && ops > 0 ? ops : 0.72;
+  }
+  const avgObp = obpSum / rows.length;
+  const avgOps = opsSum / rows.length;
+  const obpDelta = avgObp - 0.315;
+  const opsDelta = avgOps - 0.72;
+  const offenseFactor = clampProbability(1 + obpDelta * 1.6 + opsDelta * 0.65, 0.83, 1.22);
+  return { offenseFactor, avgObp, avgOps };
+}
+
+function buildRunProjectionModel({
+  lineups,
+  lineupStatsByPlayerId,
+  awayStarterEra,
+  homeStarterEra,
+  awayBullpen,
+  homeBullpen,
+  weather
+}) {
+  if (!lineups?.away?.length || !lineups?.home?.length) {
+    return null;
+  }
+  const awayOffense = computeLineupOffenseIndex(lineups.away, lineupStatsByPlayerId);
+  const homeOffense = computeLineupOffenseIndex(lineups.home, lineupStatsByPlayerId);
+
+  const awayStarterFactor = clampProbability(1 + (normalizeEraValue(homeStarterEra) - 4.0) * 0.085, 0.78, 1.28);
+  const homeStarterFactor = clampProbability(1 + (normalizeEraValue(awayStarterEra) - 4.0) * 0.085, 0.78, 1.28);
+
+  const awayBullpenEra = computeBullpenWeightedEra(homeBullpen);
+  const homeBullpenEra = computeBullpenWeightedEra(awayBullpen);
+  const awayBullpenFactor = clampProbability(1 + (awayBullpenEra - 3.95) * 0.055, 0.84, 1.2);
+  const homeBullpenFactor = clampProbability(1 + (homeBullpenEra - 3.95) * 0.055, 0.84, 1.2);
+
+  const weatherTemp = Number(weather?.temperatureC);
+  const weatherWind = Number(weather?.windSpeedKph);
+  const weatherRain = Number(weather?.precipitationProbability);
+  const weatherIsIndoor = Boolean(weather?.isIndoorLikely);
+  let weatherFactor = 1;
+  if (!weatherIsIndoor) {
+    if (Number.isFinite(weatherTemp)) {
+      weatherFactor += clampProbability((weatherTemp - 20) * 0.0035, -0.04, 0.05);
+    }
+    if (Number.isFinite(weatherWind)) {
+      weatherFactor += clampProbability((weatherWind - 14) * 0.0025, -0.015, 0.035);
+    }
+    if (Number.isFinite(weatherRain) && weatherRain >= 55) {
+      weatherFactor -= 0.02;
+    }
+  }
+  weatherFactor = clampProbability(weatherFactor, 0.9, 1.12);
+
+  const baseRunsPerTeam = 4.25;
+  const awayRuns = clampProbability(
+    baseRunsPerTeam * awayOffense.offenseFactor * awayStarterFactor * awayBullpenFactor * weatherFactor,
+    1.6,
+    8.4
+  );
+  const homeRuns = clampProbability(
+    baseRunsPerTeam * homeOffense.offenseFactor * homeStarterFactor * homeBullpenFactor * weatherFactor,
+    1.6,
+    8.4
+  );
+  const totalRuns = awayRuns + homeRuns;
+  const baselineLine = 8.5;
+  const lean = totalRuns >= baselineLine + 0.2 ? "Over" : totalRuns <= baselineLine - 0.2 ? "Under" : "Nula";
+  const edge = Math.abs(totalRuns - baselineLine);
+  const confidence = lean === "Nula" ? 0.5 : clampProbability(0.51 + edge * 0.09, 0.51, 0.68);
+  const awayAttackLevel =
+    awayOffense.offenseFactor >= 1.06
+      ? "fuerte"
+      : awayOffense.offenseFactor <= 0.95
+        ? "baja"
+        : "normal";
+  const homeAttackLevel =
+    homeOffense.offenseFactor >= 1.06
+      ? "fuerte"
+      : homeOffense.offenseFactor <= 0.95
+        ? "baja"
+        : "normal";
+  const weatherImpactLabel = weatherIsIndoor
+    ? "bajo"
+    : weatherFactor >= 1.04
+      ? "favorece mas carreras"
+      : weatherFactor <= 0.97
+        ? "puede bajar un poco las carreras"
+        : "neutral";
+  const leanLabel =
+    lean === "Over" ? "Nos inclinamos al Over" : lean === "Under" ? "Nos inclinamos al Under" : "Sin ventaja clara";
+  const plainExplanation = `Proyectamos un juego de ${totalRuns.toFixed(1)} carreras. ${leanLabel} con confianza ${Math.round(confidence * 100)}%.`;
+
+  const reasons = [
+    `La visita llega con ataque ${awayAttackLevel}, y el local con ataque ${homeAttackLevel}.`,
+    `Los abridores proyectan ${normalizeEraValue(homeStarterEra).toFixed(2)} y ${normalizeEraValue(awayStarterEra).toFixed(2)} de ERA.`,
+    `El bullpen probable pinta en ${awayBullpenEra.toFixed(2)} y ${homeBullpenEra.toFixed(2)} de ERA para cerrar el juego.`,
+    weather?.summary
+      ? `Clima ${weatherImpactLabel}: ${weather.summary}${weatherIsIndoor ? " (techo reduce impacto)." : "."}`
+      : weatherIsIndoor
+        ? "Parque con techo: el clima tiene poco impacto."
+        : "No hay señal fuerte de clima extremo."
+  ];
+
+  return {
+    awayRuns,
+    homeRuns,
+    totalRuns,
+    baselineLine,
+    lean,
+    leanLabel,
+    confidence,
+    plainExplanation,
+    reasons
+  };
+}
+
+function roundToHalf(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+  return Math.round(numeric * 2) / 2;
+}
+
+function buildRunsHistoryEntries(game, model) {
+  if (!game || !model) {
+    return [];
+  }
+  const gamePk = Number(game?.gamePk || 0);
+  const gameDate = `${game?.officialDate || `${game?.gameDate || ""}`.slice(0, 10)}`;
+  const awayTeam = game?.teams?.away?.team;
+  const homeTeam = game?.teams?.home?.team;
+  const awayAbbr = getTeamAbbreviation(awayTeam);
+  const homeAbbr = getTeamAbbreviation(homeTeam);
+  const eventLabel = `${awayAbbr} vs ${homeAbbr}`;
+  const createdAt = Date.now();
+  const gameTotalLine = Number(model?.baselineLine || 8.5);
+  const gameTotalLean = `${model?.lean || "Nula"}`;
+  const gameTotalProbability = Number(model?.confidence || 0.5);
+  const entries = [];
+  if (gameTotalLean === "Over" || gameTotalLean === "Under") {
+    entries.push({
+      entryKey: `total-game-${gamePk}`,
+      pickDomain: "game_total",
+      gamePk,
+      gameDate,
+      eventLabel,
+      pitcherId: 999001,
+      pitcherName: "Total Juego",
+      marketLabel: `Total juego O/U ${gameTotalLine.toFixed(1)}`,
+      offeredLine: gameTotalLine,
+      recommendation: gameTotalLean,
+      probability: gameTotalProbability,
+      valueLabel: "Totales",
+      status: "pending",
+      actualStrikeouts: null,
+      createdAt,
+      resolvedAt: null
+    });
+  }
+
+  const teamRows = [
+    {
+      team: awayTeam,
+      projectedRuns: Number(model?.awayRuns)
+    },
+    {
+      team: homeTeam,
+      projectedRuns: Number(model?.homeRuns)
+    }
+  ];
+  for (const row of teamRows) {
+    const teamId = Number(row?.team?.id || 0);
+    if (!teamId || !Number.isFinite(row.projectedRuns)) {
+      continue;
+    }
+    const teamLine = Math.max(3, roundToHalf(row.projectedRuns));
+    const delta = row.projectedRuns - teamLine;
+    const recommendation = delta >= 0.25 ? "Over" : delta <= -0.25 ? "Under" : "Nula";
+    if (recommendation === "Nula") {
+      continue;
+    }
+    const probability = clampProbability(0.52 + Math.abs(delta) * 0.11, 0.52, 0.69);
+    entries.push({
+      entryKey: `total-team-${gamePk}-${teamId}`,
+      pickDomain: "team_total",
+      gamePk,
+      gameDate,
+      eventLabel,
+      pitcherId: teamId,
+      pitcherName: row?.team?.name || "Equipo",
+      marketLabel: `Total ${getTeamAbbreviation(row?.team)} O/U ${teamLine.toFixed(1)}`,
+      offeredLine: teamLine,
+      recommendation,
+      probability,
+      valueLabel: "Totales",
+      status: "pending",
+      actualStrikeouts: null,
+      createdAt,
+      resolvedAt: null
+    });
+  }
+  return entries;
 }
 
 function hasGameStarted(game) {
@@ -804,7 +1063,8 @@ export default function GameCard({
   pitcherHandednessById,
   gameWeatherByGamePk,
   oddsLoading,
-  onRefreshOddsForGame
+  onRefreshOddsForGame,
+  onUpsertHistoryEntries
 }) {
   const [lineups, setLineups] = useState(null);
   const [lineupStatsByPlayerId, setLineupStatsByPlayerId] = useState({});
@@ -817,6 +1077,14 @@ export default function GameCard({
     away: {},
     home: {}
   });
+  const [bullpenOpen, setBullpenOpen] = useState(false);
+  const [bullpenLoading, setBullpenLoading] = useState(false);
+  const [bullpenError, setBullpenError] = useState("");
+  const [bullpenProbables, setBullpenProbables] = useState(null);
+  const [runsProjectionOpen, setRunsProjectionOpen] = useState(false);
+  const [runsProjectionLoading, setRunsProjectionLoading] = useState(false);
+  const [runsProjectionError, setRunsProjectionError] = useState("");
+  const [runsProjection, setRunsProjection] = useState(null);
   const [lineupError, setLineupError] = useState("");
   const [showStatsInfo, setShowStatsInfo] = useState(false);
   const [pitcherModal, setPitcherModal] = useState({
@@ -855,25 +1123,20 @@ export default function GameCard({
       ? pitcherHandednessById?.[homePitcherId]
       : pitcherHandednessById?.[awayPitcherId];
 
-  async function handleToggleLineup() {
-    const nextOpen = !lineupOpen;
-    setLineupOpen(nextOpen);
-    if (nextOpen) {
-      setActiveStatsTeam("away");
-      setShowStatsInfo(false);
+  async function ensureLineupDataLoaded() {
+    if (lineups || lineupLoading) {
+      return {
+        lineups,
+        statsByPlayerId: lineupStatsByPlayerId
+      };
     }
-
-    if (!nextOpen || lineups || lineupLoading) {
-      return;
-    }
-
     setLineupLoading(true);
     setLineupError("");
     const fetchedLineups = await fetchGameLineups(game.gamePk, game);
     if (!fetchedLineups) {
       setLineupError("No se pudo obtener el lineup de este juego.");
       setLineupLoading(false);
-      return;
+      return { lineups: null, statsByPlayerId: {} };
     }
     setLineups(fetchedLineups);
     const lineupPlayerIds = [...fetchedLineups.away, ...fetchedLineups.home].map(
@@ -900,6 +1163,24 @@ export default function GameCard({
     });
     setLineupStatsLoading(false);
     setLineupLoading(false);
+    return {
+      lineups: fetchedLineups,
+      statsByPlayerId: fetchedStats
+    };
+  }
+
+  async function handleToggleLineup() {
+    const nextOpen = !lineupOpen;
+    setLineupOpen(nextOpen);
+    if (nextOpen) {
+      setActiveStatsTeam("away");
+      setShowStatsInfo(false);
+    }
+
+    if (!nextOpen) {
+      return;
+    }
+    await ensureLineupDataLoaded();
   }
 
   async function handlePitcherDetailsOpen(side) {
@@ -992,6 +1273,85 @@ export default function GameCard({
     setOddsRefreshLoading(false);
   }
 
+  async function handleToggleBullpen() {
+    const nextOpen = !bullpenOpen;
+    setBullpenOpen(nextOpen);
+    if (!nextOpen || bullpenProbables || bullpenLoading) {
+      return;
+    }
+    setBullpenLoading(true);
+    setBullpenError("");
+    const payload = await fetchBullpenProbablesForGame(game);
+    if (!payload) {
+      setBullpenError("No se pudo estimar bullpen probable para este juego.");
+      setBullpenLoading(false);
+      return;
+    }
+    setBullpenProbables(payload);
+    setBullpenLoading(false);
+  }
+
+  async function handleToggleRunsProjection() {
+    const nextOpen = !runsProjectionOpen;
+    setRunsProjectionOpen(nextOpen);
+    if (!nextOpen || runsProjection || runsProjectionLoading) {
+      return;
+    }
+    setRunsProjectionLoading(true);
+    setRunsProjectionError("");
+    const [lineupPayload, loadedBullpen] = await Promise.all([
+      ensureLineupDataLoaded(),
+      bullpenProbables ? Promise.resolve(bullpenProbables) : fetchBullpenProbablesForGame(game)
+    ]);
+    const loadedLineups = lineupPayload?.lineups ?? null;
+    const loadedStatsByPlayerId = lineupPayload?.statsByPlayerId ?? lineupStatsByPlayerId;
+    const bullpenPayload = loadedBullpen || bullpenProbables;
+    if (!bullpenProbables && loadedBullpen) {
+      setBullpenProbables(loadedBullpen);
+    }
+    if (!loadedLineups || !bullpenPayload) {
+      setRunsProjectionError("No hay suficientes datos para proyectar carreras.");
+      setRunsProjectionLoading(false);
+      return;
+    }
+    const awayStarterEraValue = Number(pitcherErasById?.[awayPitcherId]);
+    const homeStarterEraValue = Number(pitcherErasById?.[homePitcherId]);
+    if (
+      !Number.isFinite(awayStarterEraValue) ||
+      awayStarterEraValue <= 0 ||
+      !Number.isFinite(homeStarterEraValue) ||
+      homeStarterEraValue <= 0
+    ) {
+      setRunsProjectionError(
+        "No se puede calcular Over/Under: falta ERA valida de al menos uno de los abridores."
+      );
+      setRunsProjectionLoading(false);
+      return;
+    }
+    const model = buildRunProjectionModel({
+      lineups: loadedLineups,
+      lineupStatsByPlayerId: loadedStatsByPlayerId,
+      awayStarterEra: awayStarterEraValue,
+      homeStarterEra: homeStarterEraValue,
+      awayBullpen: bullpenPayload?.away,
+      homeBullpen: bullpenPayload?.home,
+      weather: gameWeatherByGamePk?.[game?.gamePk]
+    });
+    if (!model) {
+      setRunsProjectionError("No se pudo calcular proyeccion de carreras para este juego.");
+      setRunsProjectionLoading(false);
+      return;
+    }
+    setRunsProjection(model);
+    if (onUpsertHistoryEntries) {
+      const entries = buildRunsHistoryEntries(game, model);
+      if (entries.length) {
+        await onUpsertHistoryEntries(entries);
+      }
+    }
+    setRunsProjectionLoading(false);
+  }
+
   useEffect(() => {
     if (!pitcherModal.open) {
       return undefined;
@@ -1066,6 +1426,94 @@ export default function GameCard({
           {oddsRefreshLoading ? "Refrescando odds..." : "Refrescar odds (este juego)"}
         </button>
       </div>
+
+      <button
+        type="button"
+        className="lineup-toggle"
+        onClick={handleToggleBullpen}
+        disabled={bullpenLoading}
+      >
+        {bullpenLoading
+          ? "Calculando bullpen probable..."
+          : bullpenOpen
+            ? "Ocultar bullpen probable"
+            : "Ver bullpen probable"}
+      </button>
+
+      {bullpenOpen ? (
+        <div className="bullpen-panel">
+          {bullpenError ? <p className="error">{bullpenError}</p> : null}
+          {!bullpenError && bullpenProbables ? (
+            <div className="bullpen-grid">
+              {[
+                { key: "away", label: game.teams.away.team.name },
+                { key: "home", label: game.teams.home.team.name }
+              ].map((side) => (
+                <section key={`${game.gamePk}-${side.key}`} className="bullpen-column">
+                  <h4>{side.label}</h4>
+                  {(bullpenProbables?.[side.key]?.pitchers ?? []).length ? (
+                    <ul className="bullpen-list">
+                      {(bullpenProbables?.[side.key]?.pitchers ?? []).map((pitcher) => (
+                        <li key={`${side.key}-${pitcher.pitcherId}`} className="bullpen-row">
+                          <strong>{pitcher.fullName}</strong>
+                          <span>{formatBullpenPitcherLine(pitcher)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="lineup-empty">Sin suficientes datos de bullpen.</p>
+                  )}
+                </section>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      <button
+        type="button"
+        className="lineup-toggle"
+        onClick={handleToggleRunsProjection}
+        disabled={runsProjectionLoading}
+      >
+        {runsProjectionLoading
+          ? "Calculando proyeccion O/U..."
+          : runsProjectionOpen
+            ? "Ocultar proyeccion de carreras"
+            : "Ver proyeccion de carreras (O/U)"}
+      </button>
+
+      {runsProjectionOpen ? (
+        <div className="runs-projection-panel">
+          {runsProjectionError ? <p className="error">{runsProjectionError}</p> : null}
+          {!runsProjectionError && runsProjection ? (
+            <>
+              <p className="runs-projection-main">
+                <strong>Total proyectado:</strong> {runsProjection.totalRuns.toFixed(1)} carreras ·{" "}
+                <strong>
+                  {getTeamAbbreviation(game.teams.away.team)} {runsProjection.awayRuns.toFixed(1)}
+                </strong>{" "}
+                vs{" "}
+                <strong>
+                  {getTeamAbbreviation(game.teams.home.team)} {runsProjection.homeRuns.toFixed(1)}
+                </strong>
+              </p>
+              <p className="runs-projection-main">
+                <strong>Recomendacion rapida:</strong> {runsProjection.leanLabel} · Confianza{" "}
+                {Math.round(runsProjection.confidence * 100)}%
+              </p>
+              <p className="runs-projection-main">
+                {runsProjection.plainExplanation} (Referencia interna: {runsProjection.baselineLine.toFixed(1)}).
+              </p>
+              <div className="runs-projection-reasons">
+                {runsProjection.reasons.map((reason, index) => (
+                  <p key={`${game.gamePk}-run-reason-${index}`}>- {reason}</p>
+                ))}
+              </div>
+            </>
+          ) : null}
+        </div>
+      ) : null}
 
       <button
         type="button"

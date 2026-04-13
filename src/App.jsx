@@ -8,6 +8,7 @@ import {
   fetchPitcherStrikeoutLinesByGames,
   fetchPitcherHandednessByIds,
   fetchGameWeatherByGames,
+  fetchGameScoreSummary,
   fetchMlbScheduleByDate,
   fetchPlayersHittingStatsByIds,
   fetchPlayersHittingStreaksByIds,
@@ -176,6 +177,34 @@ function upsertBatterHistoryEntries(currentEntries, newEntries) {
   return [...byKey.values()].sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
 }
 
+function upsertGenericHistoryEntries(currentEntries, newEntries) {
+  const byKey = new Map(
+    (Array.isArray(currentEntries) ? currentEntries : []).map((entry) => [entry?.entryKey, entry])
+  );
+  for (const entry of newEntries ?? []) {
+    const key = `${entry?.entryKey || ""}`.trim();
+    if (!key) {
+      continue;
+    }
+    const previous = byKey.get(key);
+    if (!previous) {
+      byKey.set(key, entry);
+      continue;
+    }
+    if (previous.status === "pending") {
+      byKey.set(key, {
+        ...previous,
+        ...entry,
+        createdAt: previous.createdAt,
+        resolvedAt: previous.resolvedAt,
+        status: previous.status,
+        actualStrikeouts: previous.actualStrikeouts
+      });
+    }
+  }
+  return [...byKey.values()].sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+}
+
 async function resolveRecommendationHistoryEntries(entries) {
   const pendingEntries = (entries ?? []).filter((entry) => entry?.status === "pending");
   if (!pendingEntries.length) {
@@ -200,7 +229,10 @@ async function resolveRecommendationHistoryEntries(entries) {
   const uniqueHitterSeasonKeys = [
     ...new Set(
       pendingEntries
-        .filter((entry) => `${entry?.pickDomain || "strikeouts"}` !== "strikeouts")
+        .filter((entry) => {
+          const domain = `${entry?.pickDomain || "strikeouts"}`.toLowerCase();
+          return domain === "hits" || domain === "onbase";
+        })
         .map((entry) => {
           const season = `${entry?.gameDate || ""}`.slice(0, 4);
           const playerId = Number(entry?.pitcherId || 0);
@@ -231,34 +263,34 @@ async function resolveRecommendationHistoryEntries(entries) {
   );
   const logsByPitcherSeason = Object.fromEntries(logsEntries);
   const logsByHitterSeason = Object.fromEntries(hitterLogsEntries);
+  const uniquePendingGamePks = [...new Set(pendingEntries.map((entry) => Number(entry?.gamePk || 0)).filter(Boolean))];
+  const gameScoreEntries = await Promise.all(
+    uniquePendingGamePks.map(async (gamePk) => [gamePk, await fetchGameScoreSummary(gamePk)])
+  );
+  const gameScoreByGamePk = Object.fromEntries(gameScoreEntries);
   const nowMs = Date.now();
-
   return (entries ?? []).map((entry) => {
     if (entry?.status !== "pending") {
       return entry;
     }
+    const domain = `${entry?.pickDomain || "strikeouts"}`.toLowerCase();
     const season = `${entry?.gameDate || ""}`.slice(0, 4);
-    const pitcherId = Number(entry?.pitcherId || 0);
-    if (!pitcherId || !season) {
+    const entityId = Number(entry?.pitcherId || 0);
+    if (!entityId || !season) {
       return entry;
     }
 
-    if (`${entry?.pickDomain || "strikeouts"}` === "strikeouts") {
-      const logs = logsByPitcherSeason?.[`${pitcherId}-${season}`] ?? [];
+    if (domain === "strikeouts") {
+      const logs = logsByPitcherSeason?.[`${entityId}-${season}`] ?? [];
       const matchingGame = logs.find((log) => Number(log?.gamePk || 0) === Number(entry?.gamePk || 0));
       if (!matchingGame) {
         return entry;
       }
-
       const actualStrikeouts = Number(matchingGame?.strikeOuts);
-      if (!Number.isFinite(actualStrikeouts)) {
-        return entry;
-      }
       const line = Number(entry?.offeredLine);
-      if (!Number.isFinite(line)) {
+      if (!Number.isFinite(actualStrikeouts) || !Number.isFinite(line)) {
         return entry;
       }
-
       const isSuccess =
         entry?.recommendation === "Over" ? actualStrikeouts > line : actualStrikeouts < line;
       return {
@@ -269,7 +301,36 @@ async function resolveRecommendationHistoryEntries(entries) {
       };
     }
 
-    const hitterLogs = logsByHitterSeason?.[`${pitcherId}-${season}`] ?? [];
+    if (domain === "game_total" || domain === "team_total") {
+      const gameSummary = gameScoreByGamePk?.[Number(entry?.gamePk || 0)];
+      if (!gameSummary?.isFinal) {
+        return entry;
+      }
+      const line = Number(entry?.offeredLine);
+      if (!Number.isFinite(line)) {
+        return entry;
+      }
+      const actualRuns =
+        domain === "game_total"
+          ? Number(gameSummary?.totalRuns)
+          : Number(gameSummary?.homeTeamId || 0) === entityId
+            ? Number(gameSummary?.homeRuns)
+            : Number(gameSummary?.awayTeamId || 0) === entityId
+              ? Number(gameSummary?.awayRuns)
+              : NaN;
+      if (!Number.isFinite(actualRuns)) {
+        return entry;
+      }
+      const isSuccess = entry?.recommendation === "Over" ? actualRuns > line : actualRuns < line;
+      return {
+        ...entry,
+        actualStrikeouts: actualRuns,
+        status: isSuccess ? "success" : "failed",
+        resolvedAt: nowMs
+      };
+    }
+
+    const hitterLogs = logsByHitterSeason?.[`${entityId}-${season}`] ?? [];
     const matchingHitterGame = hitterLogs.find(
       (log) => Number(log?.gamePk || 0) === Number(entry?.gamePk || 0)
     );
@@ -279,8 +340,7 @@ async function resolveRecommendationHistoryEntries(entries) {
     const hits = Number(matchingHitterGame?.hits || 0);
     const reachesBase =
       hits + Number(matchingHitterGame?.baseOnBalls || 0) + Number(matchingHitterGame?.hitByPitch || 0);
-
-    if (`${entry?.pickDomain || ""}`.toLowerCase() === "hits") {
+    if (domain === "hits") {
       return {
         ...entry,
         actualStrikeouts: hits,
@@ -1358,6 +1418,26 @@ export default function App() {
     }
   }
 
+  async function handleUpsertHistoryEntries(entries) {
+    const normalizedIncoming = normalizeHistoryEntries(entries);
+    if (!normalizedIncoming.length) {
+      return;
+    }
+    const nextHistory = normalizeHistoryEntries(
+      upsertGenericHistoryEntries(recommendationHistory, normalizedIncoming)
+    );
+    if (buildHistorySignature(nextHistory) === buildHistorySignature(recommendationHistory)) {
+      return;
+    }
+    setRecommendationHistory(nextHistory);
+    writeRecommendationHistory(nextHistory);
+    try {
+      await upsertRecommendationHistoryToBackend(nextHistory);
+    } catch (error) {
+      // Keep local history when backend sync fails.
+    }
+  }
+
   async function handleLogin({ username, password, rememberMe }) {
     setAuthLoading(true);
     setAuthError("");
@@ -1418,6 +1498,12 @@ export default function App() {
   const [historyPickGroup, setHistoryPickGroup] = useState("strikeouts");
 
   const selectedHistoryEntriesByGroup = useMemo(() => {
+    if (historyPickGroup === "totals") {
+      return selectedHistoryEntries.filter((entry) => {
+        const domain = `${entry?.pickDomain || ""}`.toLowerCase();
+        return domain === "game_total" || domain === "team_total";
+      });
+    }
     if (historyPickGroup === "batters") {
       return selectedHistoryEntries.filter(
         (entry) => {
@@ -1667,6 +1753,13 @@ export default function App() {
             >
               Picks Bateadores
             </button>
+            <button
+              type="button"
+              className={`games-view-button ${historyPickGroup === "totals" ? "active" : ""}`}
+              onClick={() => setHistoryPickGroup("totals")}
+            >
+              Totales O/U
+            </button>
           </div>
           {!recommendationHistory.length ? (
             <p>No hay resultados todavia. Se ira llenando cuando terminen juegos evaluados.</p>
@@ -1763,6 +1856,7 @@ export default function App() {
           gameWeatherByGamePk={gameWeatherByGamePk}
           oddsLoading={oddsLoading}
           onRefreshOddsForGame={handleRefreshOddsForGame}
+          onUpsertHistoryEntries={handleUpsertHistoryEntries}
         />
       )}
         </>

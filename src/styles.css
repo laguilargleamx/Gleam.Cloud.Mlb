@@ -727,6 +727,71 @@ body {
   color: #475569;
 }
 
+.bullpen-panel {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 0.75rem;
+  background: #fafafa;
+}
+
+.bullpen-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.bullpen-column h4 {
+  margin: 0 0 0.45rem;
+  font-size: 0.96rem;
+}
+
+.bullpen-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.bullpen-row {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 0.42rem 0.52rem;
+  background: #ffffff;
+  display: grid;
+  gap: 0.12rem;
+}
+
+.bullpen-row span {
+  font-size: 0.8rem;
+  color: #475569;
+}
+
+.runs-projection-panel {
+  border: 1px solid #dbeafe;
+  background: #f8fbff;
+  border-radius: 10px;
+  padding: 0.75rem;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.runs-projection-main {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.runs-projection-reasons {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.runs-projection-reasons p {
+  margin: 0;
+  font-size: 0.84rem;
+  color: #334155;
+}
+
 .pitchers-row {
   display: grid;
   grid-template-columns: 1fr 1fr;

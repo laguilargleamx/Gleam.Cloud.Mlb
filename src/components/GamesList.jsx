@@ -9,7 +9,8 @@ export default function GamesList({
   pitcherHandednessById,
   gameWeatherByGamePk,
   oddsLoading,
-  onRefreshOddsForGame
+  onRefreshOddsForGame,
+  onUpsertHistoryEntries
 }) {
   if (!games.length) {
     return <p>No hay juegos para esa fecha.</p>;
@@ -29,6 +30,7 @@ export default function GamesList({
           gameWeatherByGamePk={gameWeatherByGamePk}
           oddsLoading={oddsLoading}
           onRefreshOddsForGame={onRefreshOddsForGame}
+          onUpsertHistoryEntries={onUpsertHistoryEntries}
         />
       ))}
     </section>

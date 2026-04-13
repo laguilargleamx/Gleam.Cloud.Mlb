@@ -318,7 +318,7 @@ def normalize_history_game_date(value: Any) -> str:
 
 def normalize_pick_domain(value: Any) -> str:
     normalized = str(value or "").strip().lower()
-    if normalized in {"strikeouts", "hits", "onbase"}:
+    if normalized in {"strikeouts", "hits", "onbase", "game_total", "team_total"}:
         return normalized
     return "strikeouts"
 
