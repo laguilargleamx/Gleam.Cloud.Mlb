@@ -202,28 +202,13 @@ function formatRecommendationNarrative(strikeoutValue) {
   const projected = Number(strikeoutValue?.projectedStrikeouts);
   const line = Number(strikeoutValue?.offeredLine);
   const probabilityOver = Number(strikeoutValue?.probabilityOver);
-  const edge = Number(strikeoutValue?.edgeOver);
   const sampleSize = Number(strikeoutValue?.statsSampleSize) || 0;
   const opponentSample = Number(strikeoutValue?.opponentSampleSize) || 0;
-  const opponentFactor = Number(strikeoutValue?.opponentFactor);
   const workloadFactor = Number(strikeoutValue?.workloadFactor);
-  const baseProjection = Number(strikeoutValue?.baseProjection);
-  const lineThresholdUsed = Number(strikeoutValue?.lineThresholdUsed);
-  const marketOverNoVig = Number(strikeoutValue?.impliedOverProbabilityNoVig);
-  const decisionReason = `${strikeoutValue?.decisionReason || ""}`.trim();
 
   const projectedLabel = Number.isFinite(projected) ? projected.toFixed(1) : "--";
   const lineLabel = Number.isFinite(line) ? line.toFixed(1) : "--";
-  const thresholdLabel = Number.isFinite(lineThresholdUsed) ? lineThresholdUsed.toFixed(1) : lineLabel;
   const overLabel = formatPercentFromRatio(probabilityOver);
-  const edgeLabel = Number.isFinite(edge) ? formatSignedPercentFromRatio(edge) : "N/D";
-  const marketLabel = Number.isFinite(marketOverNoVig) ? formatPercentFromRatio(marketOverNoVig) : "N/D";
-  const baseLabel = Number.isFinite(baseProjection) ? baseProjection.toFixed(1) : "--";
-  const rivalImpact = Number.isFinite(opponentFactor)
-    ? opponentFactor >= 1
-      ? "favorece algo mas de ponches"
-      : "tiende a reducir el techo de ponches"
-    : "no aporta un ajuste claro";
   const workloadImpact = Number.isFinite(workloadFactor)
     ? workloadFactor >= 1
       ? "con carga reciente estable"
@@ -231,13 +216,13 @@ function formatRecommendationNarrative(strikeoutValue) {
     : "con carga reciente no concluyente";
 
   if (label === "valor") {
-    return `Se sugiere valor en esta linea: Proy ${projectedLabel}K (base ${baseLabel} x carga x rival) vs linea ${lineLabel}K. Probabilidad real modelada P(Over) ${overLabel} (umbral ${thresholdLabel}) vs mercado ${marketLabel}; edge ${edgeLabel}. El rival ${rivalImpact} y el modelo usa ${sampleSize} juegos del pitcher (${opponentSample} del rival), ${workloadImpact}. ${decisionReason}`;
+    return `Nuestra sugerencia es ir por Over. La linea esta en ${lineLabel}K y estimamos alrededor de ${projectedLabel}K, por eso vemos margen a favor. La confianza para Over es ${overLabel} y usamos ${sampleSize} juegos recientes del pitcher (${opponentSample} del rival), ${workloadImpact}.`;
   }
   if (label === "sobrevalorada") {
-    return `Se considera sobrevalorada esta linea: Proy ${projectedLabel}K (base ${baseLabel} x carga x rival) vs linea ${lineLabel}K. Probabilidad real modelada P(Over) ${overLabel} (umbral ${thresholdLabel}) vs mercado ${marketLabel}; edge ${edgeLabel}. El rival ${rivalImpact} y la muestra del modelo incluye ${sampleSize} juegos del pitcher (${opponentSample} del rival), ${workloadImpact}. ${decisionReason}`;
+    return `Nuestra sugerencia es ir por Under. La linea (${lineLabel}K) se ve alta para este contexto, porque estimamos cerca de ${projectedLabel}K. La opcion Over se ve baja (${overLabel}), asi que Under toma ventaja. Se considera el momento del pitcher y como llega el rival.`;
   }
 
-  return `Linea considerada nula: Proy ${projectedLabel}K (base ${baseLabel} x carga x rival) cerca de linea ${lineLabel}K. Probabilidad real modelada P(Over) ${overLabel} (umbral ${thresholdLabel}) vs mercado ${marketLabel}; edge ${edgeLabel}. Se apoya en ${sampleSize} juegos recientes del pitcher y ${opponentSample} del rival, ${workloadImpact}. ${decisionReason}`;
+  return `Aqui no vemos una ventaja clara. La linea (${lineLabel}K) y la proyeccion (${projectedLabel}K) estan bastante cerca, por eso la jugada se considera neutral por ahora.`;
 }
 
 function getRecommendationBadge(strikeoutValue) {
@@ -599,47 +584,130 @@ function PitcherGameLogModal({
   );
 }
 
-function StatsTable({ title, players, statsByPlayerId, streaksByPlayerId }) {
+function clampProbability(value, min = 0, max = 1) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function formatProbabilityPercent(probability) {
+  const numeric = Number(probability);
+  if (!Number.isFinite(numeric)) {
+    return "--";
+  }
+  return `${Math.round(numeric * 100)}%`;
+}
+
+function estimateHitProbability(stats, streaks, opposingPitcherHandedness) {
+  const avg = Number(stats?.avg);
+  const ops = Number(stats?.ops);
+  const hitStreak = Number(streaks?.hitStreak || 0);
+  const singleStreak = Number(streaks?.singleStreak || 0);
+  const handText = `${opposingPitcherHandedness || ""}`.toLowerCase();
+
+  const baseAvg = Number.isFinite(avg) && avg > 0 ? avg : 0.245;
+  const opsAdjustment = Number.isFinite(ops) ? clampProbability((ops - 0.72) * 0.16, -0.04, 0.06) : 0;
+  const streakAdjustment = clampProbability(hitStreak * 0.008 + singleStreak * 0.006, 0, 0.06);
+  const handAdjustment = handText.startsWith("zur") ? 0.005 : 0;
+
+  return clampProbability(baseAvg + opsAdjustment + streakAdjustment + handAdjustment, 0.14, 0.8);
+}
+
+function estimateOnBaseProbability(stats, streaks, hitProbability) {
+  const obp = Number(stats?.obp);
+  const hitStreak = Number(streaks?.hitStreak || 0);
+  const xbhStreak = Number(streaks?.xbhStreak || 0);
+
+  const baseObp =
+    Number.isFinite(obp) && obp > 0 ? obp : clampProbability(Number(hitProbability) + 0.07, 0.22, 0.42);
+  const streakAdjustment = clampProbability(hitStreak * 0.006 + xbhStreak * 0.003, 0, 0.05);
+  return clampProbability(baseObp + streakAdjustment, 0.2, 0.9);
+}
+
+function StatsTable({
+  title,
+  players,
+  statsByPlayerId,
+  streaksByPlayerId,
+  opposingPitcherHandedness
+}) {
+  const playersWithProbabilities = players.map((player) => {
+    const stats = statsByPlayerId?.[player.playerId];
+    const streaks = streaksByPlayerId?.[player.playerId];
+    const hitProbability = estimateHitProbability(stats, streaks, opposingPitcherHandedness);
+    const onBaseProbability = estimateOnBaseProbability(stats, streaks, hitProbability);
+    return {
+      ...player,
+      stats,
+      streaks,
+      hitProbability,
+      onBaseProbability
+    };
+  });
+
+  const topHitThreats = [...playersWithProbabilities]
+    .sort((a, b) => b.hitProbability - a.hitProbability)
+    .slice(0, 3);
+  const topOnBaseThreats = [...playersWithProbabilities]
+    .sort((a, b) => b.onBaseProbability - a.onBaseProbability)
+    .slice(0, 3);
+
   return (
     <section className="lineup-stats-table">
       <h4>{title}</h4>
       {!players.length ? (
         <p className="lineup-empty">Lineup no publicado</p>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Jugador</th>
-              <th>H</th>
-              <th>2B</th>
-              <th>3B</th>
-              <th>HST</th>
-              <th>1BST</th>
-              <th>XBHST</th>
-              <th>Fire</th>
-            </tr>
-          </thead>
-          <tbody>
-            {players.map((player) => {
-              const stats = statsByPlayerId?.[player.playerId];
-              const streaks = streaksByPlayerId?.[player.playerId];
-              const isFireUp =
-                (streaks?.hitStreak ?? 0) >= 4 || (streaks?.singleStreak ?? 0) >= 3;
-              return (
-                <tr key={`${title}-${player.playerId}`}>
-                  <td>{player.fullName}</td>
-                  <td>{stats?.hits ?? "-"}</td>
-                  <td>{stats?.doubles ?? "-"}</td>
-                  <td>{stats?.triples ?? "-"}</td>
-                  <td>{streaks?.hitStreak ?? "-"}</td>
-                  <td>{streaks?.singleStreak ?? "-"}</td>
-                  <td>{streaks?.xbhStreak ?? "-"}</td>
-                  <td>{isFireUp ? "🔥" : "-"}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        <>
+          <div className="lineup-prob-summary">
+            <p>
+              <strong>Top Hit:</strong>{" "}
+              {topHitThreats.map((player) => `${player.fullName} (${formatProbabilityPercent(player.hitProbability)})`).join(" · ")}
+            </p>
+            <p>
+              <strong>Top Embasarse:</strong>{" "}
+              {topOnBaseThreats
+                .map((player) => `${player.fullName} (${formatProbabilityPercent(player.onBaseProbability)})`)
+                .join(" · ")}
+            </p>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Jugador</th>
+                <th>H</th>
+                <th>2B</th>
+                <th>3B</th>
+                <th>HST</th>
+                <th>1BST</th>
+                <th>XBHST</th>
+                <th>Hit%</th>
+                <th>Emb%</th>
+                <th>Fire</th>
+              </tr>
+            </thead>
+            <tbody>
+              {playersWithProbabilities.map((player) => {
+                const stats = player.stats;
+                const streaks = player.streaks;
+                const isFireUp =
+                  (streaks?.hitStreak ?? 0) >= 4 || (streaks?.singleStreak ?? 0) >= 3;
+                return (
+                  <tr key={`${title}-${player.playerId}`}>
+                    <td>{player.fullName}</td>
+                    <td>{stats?.hits ?? "-"}</td>
+                    <td>{stats?.doubles ?? "-"}</td>
+                    <td>{stats?.triples ?? "-"}</td>
+                    <td>{streaks?.hitStreak ?? "-"}</td>
+                    <td>{streaks?.singleStreak ?? "-"}</td>
+                    <td>{streaks?.xbhStreak ?? "-"}</td>
+                    <td>{formatProbabilityPercent(player.hitProbability)}</td>
+                    <td>{formatProbabilityPercent(player.onBaseProbability)}</td>
+                    <td>{isFireUp ? "🔥" : "-"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </>
       )}
     </section>
   );
@@ -694,6 +762,10 @@ export default function GameCard({
     ? `${game.status.detailedState} - ${liveInningLabel}`
     : game.status.detailedState;
   const effectiveOddsLoading = oddsLoading || oddsRefreshLoading;
+  const activeOpposingPitcherHandedness =
+    activeStatsTeam === "away"
+      ? pitcherHandednessById?.[homePitcherId]
+      : pitcherHandednessById?.[awayPitcherId];
 
   async function handleToggleLineup() {
     const nextOpen = !lineupOpen;
@@ -951,6 +1023,12 @@ export default function GameCard({
                     <strong>XBHST:</strong> Racha actual con extra-base hit (2B/3B/HR).
                   </p>
                   <p>
+                    <strong>Hit%:</strong> Probabilidad estimada de conectar al menos un hit hoy.
+                  </p>
+                  <p>
+                    <strong>Emb%:</strong> Probabilidad estimada de embasarse hoy (hit, base por bolas, etc.).
+                  </p>
+                  <p>
                     <strong>Fire:</strong> Se activa con <strong>HST &gt;= 4</strong> o{" "}
                     <strong>1BST &gt;= 3</strong>.
                   </p>
@@ -984,6 +1062,7 @@ export default function GameCard({
                   players={activeStatsTeam === "away" ? lineups.away : lineups.home}
                   statsByPlayerId={lineupStatsByPlayerId}
                   streaksByPlayerId={lineupStreaksByPlayerId}
+                  opposingPitcherHandedness={activeOpposingPitcherHandedness}
                 />
               </div>
             </>

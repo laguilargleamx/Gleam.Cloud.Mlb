@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   evaluatePitcherStrikeoutValueByGames,
+  fetchGameLineups,
+  fetchHitterGameLogs,
   fetchPitcherGameLogs,
   fetchPitcherStrikeoutLinesForGame,
   fetchPitcherStrikeoutLinesByGames,
   fetchPitcherHandednessByIds,
   fetchMlbScheduleByDate,
+  fetchPlayersHittingStatsByIds,
+  fetchPlayersHittingStreaksByIds,
   fetchPitcherErasByIds,
   fetchPitcherStrikeoutsPerGameByIds,
   getTeamAbbreviation,
@@ -13,6 +17,7 @@ import {
   fetchRecommendationHistoryFromBackend,
   loginToBackend,
   logoutFromBackend,
+  pruneSampleRecommendationHistoryFromBackend,
   upsertRecommendationHistoryToBackend,
   setBackendAccessToken
 } from "./api/mlbApi";
@@ -106,11 +111,13 @@ function upsertRecommendationHistoryEntries(currentEntries, games, linesByPitche
       const previous = byKey.get(entryKey);
       const nextBase = {
         entryKey,
+        pickDomain: "strikeouts",
         gamePk: Number(game?.gamePk || 0),
         gameDate: gameDate || "",
         eventLabel,
         pitcherId,
         pitcherName: pitcher?.fullName || "Pitcher",
+        marketLabel: `${recommendationInfo.recommendation} ${offeredLine.toFixed(1)} K`,
         offeredLine,
         recommendation: recommendationInfo.recommendation,
         probability: recommendationInfo.probability,
@@ -140,6 +147,34 @@ function upsertRecommendationHistoryEntries(currentEntries, games, linesByPitche
   return [...byKey.values()].sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
 }
 
+function upsertBatterHistoryEntries(currentEntries, newEntries) {
+  const byKey = new Map(
+    (Array.isArray(currentEntries) ? currentEntries : []).map((entry) => [entry?.entryKey, entry])
+  );
+  for (const entry of newEntries ?? []) {
+    const key = `${entry?.entryKey || ""}`.trim();
+    if (!key) {
+      continue;
+    }
+    const previous = byKey.get(key);
+    if (!previous) {
+      byKey.set(key, entry);
+      continue;
+    }
+    if (previous.status === "pending") {
+      byKey.set(key, {
+        ...previous,
+        ...entry,
+        createdAt: previous.createdAt,
+        resolvedAt: previous.resolvedAt,
+        status: previous.status,
+        actualStrikeouts: previous.actualStrikeouts
+      });
+    }
+  }
+  return [...byKey.values()].sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+}
+
 async function resolveRecommendationHistoryEntries(entries) {
   const pendingEntries = (entries ?? []).filter((entry) => entry?.status === "pending");
   if (!pendingEntries.length) {
@@ -149,6 +184,7 @@ async function resolveRecommendationHistoryEntries(entries) {
   const uniquePitcherSeasonKeys = [
     ...new Set(
       pendingEntries
+        .filter((entry) => `${entry?.pickDomain || "strikeouts"}` === "strikeouts")
         .map((entry) => {
           const season = `${entry?.gameDate || ""}`.slice(0, 4);
           const pitcherId = Number(entry?.pitcherId || 0);
@@ -156,6 +192,21 @@ async function resolveRecommendationHistoryEntries(entries) {
             return "";
           }
           return `${pitcherId}-${season}`;
+        })
+        .filter(Boolean)
+    )
+  ];
+  const uniqueHitterSeasonKeys = [
+    ...new Set(
+      pendingEntries
+        .filter((entry) => `${entry?.pickDomain || "strikeouts"}` !== "strikeouts")
+        .map((entry) => {
+          const season = `${entry?.gameDate || ""}`.slice(0, 4);
+          const playerId = Number(entry?.pitcherId || 0);
+          if (!playerId || !season) {
+            return "";
+          }
+          return `${playerId}-${season}`;
         })
         .filter(Boolean)
     )
@@ -169,7 +220,16 @@ async function resolveRecommendationHistoryEntries(entries) {
       return [key, logs];
     })
   );
+  const hitterLogsEntries = await Promise.all(
+    uniqueHitterSeasonKeys.map(async (key) => {
+      const [playerIdRaw, season] = key.split("-");
+      const playerId = Number(playerIdRaw);
+      const logs = await fetchHitterGameLogs(playerId, season);
+      return [key, logs];
+    })
+  );
   const logsByPitcherSeason = Object.fromEntries(logsEntries);
+  const logsByHitterSeason = Object.fromEntries(hitterLogsEntries);
   const nowMs = Date.now();
 
   return (entries ?? []).map((entry) => {
@@ -181,27 +241,56 @@ async function resolveRecommendationHistoryEntries(entries) {
     if (!pitcherId || !season) {
       return entry;
     }
-    const logs = logsByPitcherSeason?.[`${pitcherId}-${season}`] ?? [];
-    const matchingGame = logs.find((log) => Number(log?.gamePk || 0) === Number(entry?.gamePk || 0));
-    if (!matchingGame) {
-      return entry;
+
+    if (`${entry?.pickDomain || "strikeouts"}` === "strikeouts") {
+      const logs = logsByPitcherSeason?.[`${pitcherId}-${season}`] ?? [];
+      const matchingGame = logs.find((log) => Number(log?.gamePk || 0) === Number(entry?.gamePk || 0));
+      if (!matchingGame) {
+        return entry;
+      }
+
+      const actualStrikeouts = Number(matchingGame?.strikeOuts);
+      if (!Number.isFinite(actualStrikeouts)) {
+        return entry;
+      }
+      const line = Number(entry?.offeredLine);
+      if (!Number.isFinite(line)) {
+        return entry;
+      }
+
+      const isSuccess =
+        entry?.recommendation === "Over" ? actualStrikeouts > line : actualStrikeouts < line;
+      return {
+        ...entry,
+        actualStrikeouts,
+        status: isSuccess ? "success" : "failed",
+        resolvedAt: nowMs
+      };
     }
 
-    const actualStrikeouts = Number(matchingGame?.strikeOuts);
-    if (!Number.isFinite(actualStrikeouts)) {
+    const hitterLogs = logsByHitterSeason?.[`${pitcherId}-${season}`] ?? [];
+    const matchingHitterGame = hitterLogs.find(
+      (log) => Number(log?.gamePk || 0) === Number(entry?.gamePk || 0)
+    );
+    if (!matchingHitterGame) {
       return entry;
     }
-    const line = Number(entry?.offeredLine);
-    if (!Number.isFinite(line)) {
-      return entry;
-    }
+    const hits = Number(matchingHitterGame?.hits || 0);
+    const reachesBase =
+      hits + Number(matchingHitterGame?.baseOnBalls || 0) + Number(matchingHitterGame?.hitByPitch || 0);
 
-    const isSuccess =
-      entry?.recommendation === "Over" ? actualStrikeouts > line : actualStrikeouts < line;
+    if (`${entry?.pickDomain || ""}`.toLowerCase() === "hits") {
+      return {
+        ...entry,
+        actualStrikeouts: hits,
+        status: hits > 0 ? "success" : "failed",
+        resolvedAt: nowMs
+      };
+    }
     return {
       ...entry,
-      actualStrikeouts,
-      status: isSuccess ? "success" : "failed",
+      actualStrikeouts: reachesBase,
+      status: reachesBase > 0 ? "success" : "failed",
       resolvedAt: nowMs
     };
   });
@@ -211,20 +300,26 @@ function buildHistorySignature(entries) {
   return (entries ?? [])
     .map(
       (entry) =>
-        `${entry?.entryKey}|${entry?.status}|${entry?.offeredLine}|${entry?.recommendation}|${entry?.actualStrikeouts ?? ""}`
+        `${entry?.entryKey}|${entry?.pickDomain}|${entry?.status}|${entry?.offeredLine}|${entry?.recommendation}|${entry?.actualStrikeouts ?? ""}`
     )
     .join(";");
 }
 
 function normalizeHistoryEntries(entries) {
+  function isSampleEntry(entry) {
+    return `${entry?.entryKey || ""}`.startsWith("sample-") || Number(entry?.gamePk || 0) >= 900000;
+  }
+
   return (Array.isArray(entries) ? entries : [])
     .map((entry) => ({
       entryKey: `${entry?.entryKey || ""}`,
+      pickDomain: `${entry?.pickDomain || "strikeouts"}`,
       gamePk: Number(entry?.gamePk || 0),
       gameDate: `${entry?.gameDate || ""}`,
       eventLabel: `${entry?.eventLabel || ""}`,
       pitcherId: Number(entry?.pitcherId || 0),
       pitcherName: `${entry?.pitcherName || ""}`,
+      marketLabel: `${entry?.marketLabel || ""}`,
       offeredLine: Number(entry?.offeredLine || 0),
       recommendation: `${entry?.recommendation || "Nula"}`,
       probability: Number(entry?.probability || 0),
@@ -237,6 +332,7 @@ function normalizeHistoryEntries(entries) {
       createdAt: Number(entry?.createdAt || Date.now()),
       resolvedAt: entry?.resolvedAt ? Number(entry.resolvedAt) : null
     }))
+    .filter((entry) => !isSampleEntry(entry))
     .filter((entry) => entry.entryKey && entry.pitcherId && entry.gamePk)
     .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
 }
@@ -254,6 +350,44 @@ function formatHistoryDate(isoDate) {
     month: "2-digit",
     year: "numeric"
   });
+}
+
+function clampProbability(value, min = 0, max = 1) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function estimateHitProbability(stats, streaks, opposingPitcherHandedness) {
+  const avg = Number(stats?.avg);
+  const ops = Number(stats?.ops);
+  const hitStreak = Number(streaks?.hitStreak || 0);
+  const singleStreak = Number(streaks?.singleStreak || 0);
+  const handText = `${opposingPitcherHandedness || ""}`.toLowerCase();
+
+  const baseAvg = Number.isFinite(avg) && avg > 0 ? avg : 0.245;
+  const opsAdjustment = Number.isFinite(ops) ? clampProbability((ops - 0.72) * 0.16, -0.04, 0.06) : 0;
+  const streakAdjustment = clampProbability(hitStreak * 0.008 + singleStreak * 0.006, 0, 0.06);
+  const handAdjustment = handText.startsWith("zur") ? 0.005 : 0;
+
+  return clampProbability(baseAvg + opsAdjustment + streakAdjustment + handAdjustment, 0.14, 0.8);
+}
+
+function estimateOnBaseProbability(stats, streaks, hitProbability) {
+  const obp = Number(stats?.obp);
+  const hitStreak = Number(streaks?.hitStreak || 0);
+  const xbhStreak = Number(streaks?.xbhStreak || 0);
+
+  const baseObp =
+    Number.isFinite(obp) && obp > 0 ? obp : clampProbability(Number(hitProbability) + 0.07, 0.22, 0.42);
+  const streakAdjustment = clampProbability(hitStreak * 0.006 + xbhStreak * 0.003, 0, 0.05);
+  return clampProbability(baseObp + streakAdjustment, 0.2, 0.9);
+}
+
+function formatPercent(probability) {
+  const numeric = Number(probability);
+  if (!Number.isFinite(numeric)) {
+    return "--";
+  }
+  return `${Math.round(numeric * 100)}%`;
 }
 
 function getTodayIsoDate() {
@@ -518,8 +652,8 @@ function writeAppDataCache(selectedDate, payload) {
 
 export default function App() {
   const todayDate = useMemo(() => getTodayIsoDate(), []);
-  const minSelectableDate = useMemo(() => addDays(todayDate, -3), [todayDate]);
-  const maxSelectableDate = useMemo(() => addDays(todayDate, 14), [todayDate]);
+  const minSelectableDate = useMemo(() => todayDate, [todayDate]);
+  const maxSelectableDate = useMemo(() => addDays(todayDate, 5), [todayDate]);
   const [selectedDate, setSelectedDate] = useState(todayDate);
   const [games, setGames] = useState([]);
   const [pitcherErasById, setPitcherErasById] = useState({});
@@ -537,6 +671,13 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
   const [activeMainView, setActiveMainView] = useState("games");
+  const [topPicksLoading, setTopPicksLoading] = useState(false);
+  const [topPicksError, setTopPicksError] = useState("");
+  const [topPicks, setTopPicks] = useState({
+    strikeouts: [],
+    hits: [],
+    onBase: []
+  });
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [historySyncLoading, setHistorySyncLoading] = useState(false);
   const [recommendationHistory, setRecommendationHistory] = useState(() =>
@@ -584,6 +725,7 @@ export default function App() {
     async function loadRecommendationHistory() {
       setHistorySyncLoading(true);
       try {
+        await pruneSampleRecommendationHistoryFromBackend();
         const remoteEntries = await fetchRecommendationHistoryFromBackend();
         if (ignore) {
           return;
@@ -666,6 +808,229 @@ export default function App() {
     games,
     pitcherStrikeoutLinesById,
     pitcherStrikeoutValueById,
+    recommendationHistory
+  ]);
+
+  useEffect(() => {
+    if (!isAuthenticated || activeMainView !== "top") {
+      return undefined;
+    }
+    let ignore = false;
+
+    async function loadTopPicks() {
+      setTopPicksLoading(true);
+      setTopPicksError("");
+      try {
+        const strikeoutCandidates = [];
+        for (const game of games) {
+          const awayTeam = game?.teams?.away?.team;
+          const homeTeam = game?.teams?.home?.team;
+          const eventLabel = `${getTeamAbbreviation(awayTeam)} vs ${getTeamAbbreviation(homeTeam)}`;
+          for (const side of [game?.teams?.away, game?.teams?.home]) {
+            const pitcher = side?.probablePitcher;
+            const pitcherId = Number(pitcher?.id || 0);
+            if (!pitcherId) {
+              continue;
+            }
+            const lineNode = pitcherStrikeoutLinesById?.[pitcherId];
+            const strikeoutValue = pitcherStrikeoutValueById?.[pitcherId];
+            if (!lineNode || !strikeoutValue || strikeoutValue?.unavailableReason) {
+              continue;
+            }
+            const recommendation = resolveRecommendationByValue(strikeoutValue);
+            if (recommendation.recommendation === "Nula") {
+              continue;
+            }
+            strikeoutCandidates.push({
+              key: `so-${game?.gamePk}-${pitcherId}`,
+              gamePk: Number(game?.gamePk || 0),
+              gameDate: `${game?.officialDate || `${game?.gameDate || ""}`.slice(0, 10)}`,
+              playerId: pitcherId,
+              eventLabel,
+              playerName: pitcher?.fullName || "Pitcher",
+              marketLabel: `${recommendation.recommendation} ${Number(lineNode?.line).toFixed(1)} K`,
+              recommendation: recommendation.recommendation,
+              offeredLine: Number(lineNode?.line),
+              probability: recommendation.probability
+            });
+          }
+        }
+
+        const lineupResults = await Promise.all(
+          games.map(async (game) => {
+            const lineups = await fetchGameLineups(game?.gamePk);
+            return [game, lineups];
+          })
+        );
+
+        const hitterCandidates = [];
+        for (const [game, lineups] of lineupResults) {
+          if (!lineups?.away?.length && !lineups?.home?.length) {
+            continue;
+          }
+          const awayPitcherId = game?.teams?.away?.probablePitcher?.id;
+          const homePitcherId = game?.teams?.home?.probablePitcher?.id;
+          const awayOpposingHand = pitcherHandednessById?.[homePitcherId];
+          const homeOpposingHand = pitcherHandednessById?.[awayPitcherId];
+          const awayTeam = game?.teams?.away?.team;
+          const homeTeam = game?.teams?.home?.team;
+          const eventLabel = `${getTeamAbbreviation(awayTeam)} vs ${getTeamAbbreviation(homeTeam)}`;
+
+          for (const player of lineups?.away ?? []) {
+            if (!player?.playerId) {
+              continue;
+            }
+            hitterCandidates.push({
+              key: `h-away-${game?.gamePk}-${player.playerId}`,
+              gamePk: Number(game?.gamePk || 0),
+              gameDate: `${game?.officialDate || `${game?.gameDate || ""}`.slice(0, 10)}`,
+              eventLabel,
+              playerId: player.playerId,
+              playerName: player.fullName,
+              opposingPitcherHandedness: awayOpposingHand
+            });
+          }
+          for (const player of lineups?.home ?? []) {
+            if (!player?.playerId) {
+              continue;
+            }
+            hitterCandidates.push({
+              key: `h-home-${game?.gamePk}-${player.playerId}`,
+              gamePk: Number(game?.gamePk || 0),
+              gameDate: `${game?.officialDate || `${game?.gameDate || ""}`.slice(0, 10)}`,
+              eventLabel,
+              playerId: player.playerId,
+              playerName: player.fullName,
+              opposingPitcherHandedness: homeOpposingHand
+            });
+          }
+        }
+
+        const uniqueHitterIds = [...new Set(hitterCandidates.map((candidate) => candidate.playerId))];
+        const season = selectedDate.split("-")[0];
+        const [statsByPlayerId, streaksByPlayerId] = await Promise.all([
+          fetchPlayersHittingStatsByIds(uniqueHitterIds, season),
+          fetchPlayersHittingStreaksByIds(uniqueHitterIds, season)
+        ]);
+
+        const hitCandidates = [];
+        const onBaseCandidates = [];
+        for (const candidate of hitterCandidates) {
+          const stats = statsByPlayerId?.[candidate.playerId];
+          const streaks = streaksByPlayerId?.[candidate.playerId];
+          const hitProbability = estimateHitProbability(
+            stats,
+            streaks,
+            candidate.opposingPitcherHandedness
+          );
+          const onBaseProbability = estimateOnBaseProbability(stats, streaks, hitProbability);
+          hitCandidates.push({
+            key: `hit-${candidate.key}`,
+            gamePk: candidate.gamePk,
+            gameDate: candidate.gameDate,
+            playerId: candidate.playerId,
+            eventLabel: candidate.eventLabel,
+            playerName: candidate.playerName,
+            marketLabel: "Conectar hit",
+            probability: hitProbability
+          });
+          onBaseCandidates.push({
+            key: `ob-${candidate.key}`,
+            gamePk: candidate.gamePk,
+            gameDate: candidate.gameDate,
+            playerId: candidate.playerId,
+            eventLabel: candidate.eventLabel,
+            playerName: candidate.playerName,
+            marketLabel: "Embasarse",
+            probability: onBaseProbability
+          });
+        }
+
+        const topDomain = (rows) => [...rows].sort((a, b) => b.probability - a.probability).slice(0, 2);
+        const topStrikeouts = topDomain(strikeoutCandidates);
+        const topHits = topDomain(hitCandidates);
+        const topOnBase = topDomain(onBaseCandidates);
+        if (!ignore) {
+          setTopPicks({
+            strikeouts: topStrikeouts,
+            hits: topHits,
+            onBase: topOnBase
+          });
+
+          const batterEntries = [
+            ...topHits.map((pick) => ({
+              entryKey: `bat-hits-${pick.gamePk}-${pick.playerId}`,
+              pickDomain: "hits",
+              gamePk: pick.gamePk,
+              gameDate: pick.gameDate,
+              eventLabel: pick.eventLabel,
+              pitcherId: pick.playerId,
+              pitcherName: pick.playerName,
+              marketLabel: pick.marketLabel,
+              offeredLine: 0,
+              recommendation: "Hit",
+              probability: pick.probability,
+              valueLabel: "Bateadores",
+              status: "pending",
+              actualStrikeouts: null,
+              createdAt: Date.now(),
+              resolvedAt: null
+            })),
+            ...topOnBase.map((pick) => ({
+              entryKey: `bat-onbase-${pick.gamePk}-${pick.playerId}`,
+              pickDomain: "onBase",
+              gamePk: pick.gamePk,
+              gameDate: pick.gameDate,
+              eventLabel: pick.eventLabel,
+              pitcherId: pick.playerId,
+              pitcherName: pick.playerName,
+              marketLabel: pick.marketLabel,
+              offeredLine: 0,
+              recommendation: "Embasarse",
+              probability: pick.probability,
+              valueLabel: "Bateadores",
+              status: "pending",
+              actualStrikeouts: null,
+              createdAt: Date.now(),
+              resolvedAt: null
+            }))
+          ];
+          const nextHistory = normalizeHistoryEntries(
+            upsertBatterHistoryEntries(recommendationHistory, batterEntries)
+          );
+          if (buildHistorySignature(nextHistory) !== buildHistorySignature(recommendationHistory)) {
+            setRecommendationHistory(nextHistory);
+            writeRecommendationHistory(nextHistory);
+            try {
+              await upsertRecommendationHistoryToBackend(nextHistory);
+            } catch (error) {
+              // Keep local data if backend sync fails.
+            }
+          }
+        }
+      } catch (error) {
+        if (!ignore) {
+          setTopPicksError("No se pudieron calcular los top picks del dia.");
+        }
+      } finally {
+        if (!ignore) {
+          setTopPicksLoading(false);
+        }
+      }
+    }
+
+    loadTopPicks();
+    return () => {
+      ignore = true;
+    };
+  }, [
+    isAuthenticated,
+    activeMainView,
+    games,
+    selectedDate,
+    pitcherStrikeoutLinesById,
+    pitcherStrikeoutValueById,
+    pitcherHandednessById,
     recommendationHistory
   ]);
 
@@ -909,82 +1274,57 @@ export default function App() {
     }
   }
 
-  async function handleLoadHistoryExample() {
-    const yesterday = addDays(getTodayIsoDate(), -1);
-    const sampleEntries = [
-      {
-        entryKey: `sample-${yesterday}-1`,
-        gamePk: 999001,
-        gameDate: yesterday,
-        eventLabel: "ARI vs PHI",
-        pitcherId: 607074,
-        pitcherName: "Zac Gallen",
-        offeredLine: 5.5,
-        recommendation: "Under",
-        probability: 0.99,
-        valueLabel: "Sobrevalorada",
-        status: "success",
-        actualStrikeouts: 4,
-        createdAt: Date.now() - 24 * 60 * 60 * 1000,
-        resolvedAt: Date.now() - 12 * 60 * 60 * 1000
-      },
-      {
-        entryKey: `sample-${yesterday}-2`,
-        gamePk: 999002,
-        gameDate: yesterday,
-        eventLabel: "NYY vs BOS",
-        pitcherId: 592450,
-        pitcherName: "Gerrit Cole",
-        offeredLine: 6.5,
-        recommendation: "Over",
-        probability: 0.62,
-        valueLabel: "Valor",
-        status: "failed",
-        actualStrikeouts: 5,
-        createdAt: Date.now() - 24 * 60 * 60 * 1000 + 1000,
-        resolvedAt: Date.now() - 12 * 60 * 60 * 1000 + 1000
-      },
-      {
-        entryKey: `sample-${yesterday}-3`,
-        gamePk: 999003,
-        gameDate: yesterday,
-        eventLabel: "LAD vs SD",
-        pitcherId: 605141,
-        pitcherName: "Yu Darvish",
-        offeredLine: 4.5,
-        recommendation: "Over",
-        probability: 0.58,
-        valueLabel: "Valor",
-        status: "pending",
-        actualStrikeouts: null,
-        createdAt: Date.now() - 24 * 60 * 60 * 1000 + 2000,
-        resolvedAt: null
-      }
-    ];
-
-    const byKey = new Map(recommendationHistory.map((entry) => [entry.entryKey, entry]));
-    for (const sample of sampleEntries) {
-      if (!byKey.has(sample.entryKey)) {
-        byKey.set(sample.entryKey, sample);
-      }
-    }
-    const nextEntries = normalizeHistoryEntries([...byKey.values()]);
-    setRecommendationHistory(nextEntries);
-    writeRecommendationHistory(nextEntries);
-    try {
-      await upsertRecommendationHistoryToBackend(nextEntries);
-    } catch (error) {
-      // Keep local examples if backend write fails.
-    }
-    setActiveMainView("history");
-  }
-
-  const historySummary = useMemo(() => {
-    const success = recommendationHistory.filter((entry) => entry.status === "success").length;
-    const failed = recommendationHistory.filter((entry) => entry.status === "failed").length;
-    const pending = recommendationHistory.filter((entry) => entry.status === "pending").length;
-    return { success, failed, pending };
+  const historyDates = useMemo(() => {
+    return [...new Set(recommendationHistory.map((entry) => entry?.gameDate).filter(Boolean))].sort(
+      (a, b) => `${b}`.localeCompare(`${a}`)
+    );
   }, [recommendationHistory]);
+
+  const [historySelectedDate, setHistorySelectedDate] = useState("");
+
+  useEffect(() => {
+    if (!historyDates.length) {
+      if (historySelectedDate) {
+        setHistorySelectedDate("");
+      }
+      return;
+    }
+    if (!historySelectedDate || !historyDates.includes(historySelectedDate)) {
+      setHistorySelectedDate(historyDates[0]);
+    }
+  }, [historyDates, historySelectedDate]);
+
+  const selectedHistoryEntries = useMemo(() => {
+    if (!historySelectedDate) {
+      return [];
+    }
+    return recommendationHistory.filter((entry) => entry?.gameDate === historySelectedDate);
+  }, [recommendationHistory, historySelectedDate]);
+
+  const [historyPickGroup, setHistoryPickGroup] = useState("strikeouts");
+
+  const selectedHistoryEntriesByGroup = useMemo(() => {
+    if (historyPickGroup === "batters") {
+      return selectedHistoryEntries.filter(
+        (entry) => {
+          const domain = `${entry?.pickDomain || "strikeouts"}`.toLowerCase();
+          return domain === "hits" || domain === "onbase";
+        }
+      );
+    }
+    return selectedHistoryEntries.filter(
+      (entry) => `${entry?.pickDomain || "strikeouts"}`.toLowerCase() === "strikeouts"
+    );
+  }, [selectedHistoryEntries, historyPickGroup]);
+
+  const selectedHistorySummary = useMemo(() => {
+    const success = selectedHistoryEntriesByGroup.filter((entry) => entry.status === "success").length;
+    const failed = selectedHistoryEntriesByGroup.filter((entry) => entry.status === "failed").length;
+    const pending = selectedHistoryEntriesByGroup.filter((entry) => entry.status === "pending").length;
+    return { success, failed, pending };
+  }, [selectedHistoryEntriesByGroup]);
+
+  const selectedHistoryDateIndex = historyDates.indexOf(historySelectedDate);
 
   if (!isAuthenticated) {
     return (
@@ -1023,65 +1363,160 @@ export default function App() {
           className={`games-view-button ${activeMainView === "history" ? "active" : ""}`}
           onClick={() => setActiveMainView("history")}
         >
-          Historial recomendaciones
+          Bitacora de Picks
         </button>
-        <button type="button" className="games-view-button" onClick={handleLoadHistoryExample}>
-          Cargar ejemplo de ayer
+        <button
+          type="button"
+          className={`games-view-button ${activeMainView === "top" ? "active" : ""}`}
+          onClick={() => setActiveMainView("top")}
+        >
+          Top Picks del dia
         </button>
       </div>
+      {activeMainView === "top" ? (
+        <section className="history-panel">
+          <div className="history-header-row">
+            <strong>Top Picks del dia ({selectedDate})</strong>
+          </div>
+          <p className="history-summary">
+            2 recomendaciones por dominio (Strikeouts, Hits y Embasarse) en todos los juegos del dia.
+            {topPicksLoading ? " · Calculando..." : ""}
+          </p>
+          {topPicksError ? <p className="error">{topPicksError}</p> : null}
+          {!topPicksLoading ? (
+            <div className="top-picks-grid">
+              {[
+                { key: "strikeouts", title: "Strikeouts (Over/Under)", rows: topPicks.strikeouts },
+                { key: "hits", title: "Hits", rows: topPicks.hits },
+                { key: "onBase", title: "Embasarse", rows: topPicks.onBase }
+              ].map((domain) => (
+                <article key={domain.key} className="top-picks-card">
+                  <h3>{domain.title}</h3>
+                  {!domain.rows.length ? (
+                    <p>Sin suficiente data para este dominio.</p>
+                  ) : (
+                    <ol>
+                      {domain.rows.map((row) => (
+                        <li key={row.key}>
+                          <strong>{row.playerName}</strong>
+                          <span>{row.eventLabel}</span>
+                          <small>
+                            {row.marketLabel} · Prob. {formatPercent(row.probability)}
+                          </small>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
       {activeMainView === "history" ? (
         <section className="history-panel">
+          <div className="history-header-row">
+            <strong>Bitacora de Picks</strong>
+            {historyDates.length ? (
+              <div className="history-day-pager">
+                <button
+                  type="button"
+                  className="games-view-button"
+                  onClick={() => setHistorySelectedDate(historyDates[selectedHistoryDateIndex + 1] || "")}
+                  disabled={selectedHistoryDateIndex < 0 || selectedHistoryDateIndex >= historyDates.length - 1}
+                >
+                  Dia anterior
+                </button>
+                <span>
+                  {formatHistoryDate(historySelectedDate)}
+                  {historyDates.length > 1
+                    ? ` · ${selectedHistoryDateIndex + 1}/${historyDates.length}`
+                    : ""}
+                </span>
+                <button
+                  type="button"
+                  className="games-view-button"
+                  onClick={() => setHistorySelectedDate(historyDates[selectedHistoryDateIndex - 1] || "")}
+                  disabled={selectedHistoryDateIndex <= 0}
+                >
+                  Dia siguiente
+                </button>
+              </div>
+            ) : null}
+          </div>
           <p className="history-summary">
-            Exitos: <strong>{historySummary.success}</strong> · Failed:{" "}
-            <strong>{historySummary.failed}</strong> · Pendientes:{" "}
-            <strong>{historySummary.pending}</strong>
+            Exitos: <strong>{selectedHistorySummary.success}</strong> · Failed:{" "}
+            <strong>{selectedHistorySummary.failed}</strong> · Pendientes:{" "}
+            <strong>{selectedHistorySummary.pending}</strong>
+            {historyDates.length ? ` · Total dias: ${historyDates.length}` : ""}
             {historySyncLoading ? " · Actualizando..." : ""}
           </p>
+          <div className="games-view-toggle" role="tablist" aria-label="Tipo de picks">
+            <button
+              type="button"
+              className={`games-view-button ${historyPickGroup === "strikeouts" ? "active" : ""}`}
+              onClick={() => setHistoryPickGroup("strikeouts")}
+            >
+              Picks Strikeouts
+            </button>
+            <button
+              type="button"
+              className={`games-view-button ${historyPickGroup === "batters" ? "active" : ""}`}
+              onClick={() => setHistoryPickGroup("batters")}
+            >
+              Picks Bateadores
+            </button>
+          </div>
           {!recommendationHistory.length ? (
-            <p>No hay historial todavia. Se ira llenando cuando terminen juegos evaluados.</p>
+            <p>No hay resultados todavia. Se ira llenando cuando terminen juegos evaluados.</p>
           ) : (
-            <div className="history-table-wrap">
-              <table className="history-table">
-                <thead>
-                  <tr>
-                    <th>Fecha</th>
-                    <th>Evento</th>
-                    <th>Pitcher</th>
-                    <th>Linea</th>
-                    <th>Recomendacion</th>
-                    <th>Resultado</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {recommendationHistory.map((entry) => (
-                    <tr key={entry.entryKey}>
-                      <td>{formatHistoryDate(entry.gameDate)}</td>
-                      <td>{entry.eventLabel}</td>
-                      <td>{entry.pitcherName}</td>
-                      <td>{Number(entry.offeredLine).toFixed(1)} K</td>
-                      <td>
-                        {entry.recommendation} ({(Number(entry.probability || 0) * 100).toFixed(0)}%)
-                      </td>
-                      <td>
-                        {entry.actualStrikeouts === null || entry.actualStrikeouts === undefined
-                          ? "-"
-                          : `${entry.actualStrikeouts} K`}
-                      </td>
-                      <td>
-                        <span className={`history-status ${entry.status}`}>
-                          {entry.status === "success"
-                            ? "Exito"
-                            : entry.status === "failed"
-                              ? "Failed"
-                              : "Pendiente"}
-                        </span>
-                      </td>
+            selectedHistoryEntriesByGroup.length ? (
+              <div className="history-table-wrap">
+                <table className="history-table">
+                  <thead>
+                    <tr>
+                      <th>Evento</th>
+                      <th>Jugador</th>
+                      <th>Pick</th>
+                      <th>Recomendacion</th>
+                      <th>Resultado</th>
+                      <th>Status</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody>
+                    {selectedHistoryEntriesByGroup.map((entry) => (
+                      <tr key={entry.entryKey}>
+                        <td>{entry.eventLabel}</td>
+                        <td>{entry.pitcherName}</td>
+                        <td>
+                          {entry.marketLabel ||
+                            (`${entry?.pickDomain || "strikeouts"}`.toLowerCase() === "strikeouts"
+                              ? `${Number(entry.offeredLine).toFixed(1)} K`
+                              : `${entry.recommendation}`)}
+                        </td>
+                        <td>
+                          {entry.recommendation} ({(Number(entry.probability || 0) * 100).toFixed(0)}%)
+                        </td>
+                        <td>
+                          {entry.actualStrikeouts === null || entry.actualStrikeouts === undefined ? "-" : `${entry.actualStrikeouts}`}
+                        </td>
+                        <td>
+                          <span className={`history-status ${entry.status}`}>
+                            {entry.status === "success"
+                              ? "Exito"
+                              : entry.status === "failed"
+                                ? "Failed"
+                                : "Pendiente"}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p>No hay picks de este tipo para ese dia.</p>
+            )
           )}
         </section>
       ) : null}

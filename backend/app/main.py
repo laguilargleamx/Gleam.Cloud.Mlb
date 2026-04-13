@@ -288,6 +288,10 @@ def normalize_recommendation_side(side: Any) -> str:
         return "Over"
     if normalized == "under":
         return "Under"
+    if normalized in {"hit", "hits"}:
+        return "Hit"
+    if normalized in {"embasarse", "onbase"}:
+        return "Embasarse"
     return "Nula"
 
 
@@ -299,6 +303,13 @@ def normalize_history_game_date(value: Any) -> str:
         return datetime.fromisoformat(raw[:10]).date().isoformat()
     except ValueError:
         return ""
+
+
+def normalize_pick_domain(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"strikeouts", "hits", "onbase"}:
+        return normalized
+    return "strikeouts"
 
 
 async def fetch_odds_json(path: str, params: dict[str, Any]) -> Any:
@@ -415,11 +426,13 @@ def create_tables_if_needed() -> None:
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       username VARCHAR(64) NOT NULL,
       entry_key VARCHAR(128) NOT NULL,
+      pick_domain VARCHAR(24) NOT NULL DEFAULT 'strikeouts',
       game_pk BIGINT NOT NULL,
       game_date DATE NULL,
       event_label VARCHAR(64) NOT NULL,
       pitcher_id BIGINT NOT NULL,
       pitcher_name VARCHAR(128) NOT NULL,
+      market_label VARCHAR(64) NULL,
       offered_line DECIMAL(6,2) NOT NULL,
       recommendation VARCHAR(12) NOT NULL,
       probability DECIMAL(6,4) NOT NULL DEFAULT 0,
@@ -439,6 +452,18 @@ def create_tables_if_needed() -> None:
             cur.execute(odds_sql)
             cur.execute(revoked_tokens_sql)
             cur.execute(recommendation_history_sql)
+            cur.execute(
+                """
+                ALTER TABLE recommendation_history
+                ADD COLUMN IF NOT EXISTS pick_domain VARCHAR(24) NOT NULL DEFAULT 'strikeouts'
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE recommendation_history
+                ADD COLUMN IF NOT EXISTS market_label VARCHAR(64) NULL
+                """
+            )
 
 
 def load_cached_game_lines(
@@ -542,11 +567,13 @@ def load_recommendation_history(
             """
             SELECT
               entry_key,
+              pick_domain,
               game_pk,
               game_date,
               event_label,
               pitcher_id,
               pitcher_name,
+              market_label,
               offered_line,
               recommendation,
               probability,
@@ -569,11 +596,13 @@ def load_recommendation_history(
         entries.append(
             {
                 "entryKey": row.get("entry_key") or "",
+                "pickDomain": row.get("pick_domain") or "strikeouts",
                 "gamePk": int(row.get("game_pk") or 0),
                 "gameDate": game_date.isoformat() if game_date else "",
                 "eventLabel": row.get("event_label") or "",
                 "pitcherId": int(row.get("pitcher_id") or 0),
                 "pitcherName": row.get("pitcher_name") or "",
+                "marketLabel": row.get("market_label") or "",
                 "offeredLine": parse_decimal(row.get("offered_line")),
                 "recommendation": row.get("recommendation") or "Nula",
                 "probability": parse_decimal(row.get("probability")) or 0,
@@ -606,6 +635,8 @@ def upsert_recommendation_history_entry(
         return False
 
     game_date = normalize_history_game_date(entry.get("gameDate"))
+    pick_domain = normalize_pick_domain(entry.get("pickDomain"))
+    market_label = str(entry.get("marketLabel") or "").strip()
     recommendation = normalize_recommendation_side(entry.get("recommendation"))
     probability = parse_decimal(entry.get("probability")) or 0
     value_label = str(entry.get("valueLabel") or "").strip()
@@ -618,17 +649,19 @@ def upsert_recommendation_history_entry(
         cur.execute(
             """
             INSERT INTO recommendation_history (
-              username, entry_key, game_pk, game_date, event_label, pitcher_id,
-              pitcher_name, offered_line, recommendation, probability, value_label,
+              username, entry_key, pick_domain, game_pk, game_date, event_label, pitcher_id,
+              pitcher_name, market_label, offered_line, recommendation, probability, value_label,
               status, actual_strikeouts, created_at, resolved_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
+              pick_domain = VALUES(pick_domain),
               game_pk = VALUES(game_pk),
               game_date = VALUES(game_date),
               event_label = VALUES(event_label),
               pitcher_id = VALUES(pitcher_id),
               pitcher_name = VALUES(pitcher_name),
+              market_label = VALUES(market_label),
               offered_line = VALUES(offered_line),
               recommendation = VALUES(recommendation),
               probability = VALUES(probability),
@@ -641,11 +674,13 @@ def upsert_recommendation_history_entry(
             (
                 username,
                 entry_key,
+                pick_domain,
                 game_pk,
                 game_date or None,
                 event_label,
                 pitcher_id,
                 pitcher_name,
+                market_label or None,
                 offered_line,
                 recommendation,
                 probability,
@@ -835,6 +870,30 @@ def recommendations_history_upsert(
         raise HTTPException(status_code=500, detail=f"Unexpected history backend error: {exc}") from exc
 
     return {"ok": True, "upserted": upserted}
+
+
+@app.post("/recommendations/history/prune-samples")
+def recommendations_history_prune_samples(
+    auth_payload: dict[str, Any] = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    username = str(auth_payload.get("sub") or APP_AUTH_USERNAME)
+    deleted = 0
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM recommendation_history
+                    WHERE username = %s
+                      AND (entry_key LIKE 'sample-%%' OR game_pk >= 900000)
+                    """,
+                    (username,),
+                )
+                deleted = int(cur.rowcount or 0)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected history backend error: {exc}") from exc
+
+    return {"ok": True, "deleted": deleted}
 
 
 @app.post("/odds/lines/by-games")

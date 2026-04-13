@@ -19,6 +19,7 @@ const pitcherHandednessCache = new Map();
 const lineupCache = new Map();
 const playerHittingStatsCache = new Map();
 const playerHittingStreakCache = new Map();
+const playerHittingGameLogsCache = new Map();
 const pitcherStrikeoutLineCache = new Map();
 let backendAccessToken = "";
 
@@ -313,6 +314,20 @@ export async function upsertRecommendationHistoryToBackend(entries) {
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = payload?.detail || `Backend recommendation upsert error ${response.status}`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+export async function pruneSampleRecommendationHistoryFromBackend() {
+  const url = buildBackendApiUrl("/recommendations/history/prune-samples");
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: buildAuthenticatedHeaders()
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = payload?.detail || `Backend recommendation prune error ${response.status}`;
     throw new Error(message);
   }
   return payload;
@@ -1258,7 +1273,10 @@ export async function fetchPlayerHittingStats(playerId, season) {
       ? {
           hits: stat.hits ?? 0,
           doubles: stat.doubles ?? 0,
-          triples: stat.triples ?? 0
+          triples: stat.triples ?? 0,
+          avg: parseRateStat(stat.avg),
+          obp: parseRateStat(stat.obp),
+          ops: parseRateStat(stat.ops)
         }
       : null;
 
@@ -1280,6 +1298,24 @@ export async function fetchPlayersHittingStatsByIds(playerIds, season) {
   );
 
   return Object.fromEntries(results);
+}
+
+function parseRateStat(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  const text = `${value}`.trim();
+  const numeric = Number(text);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  if (text.startsWith(".")) {
+    return numeric;
+  }
+  if (numeric > 1) {
+    return numeric / 1000;
+  }
+  return numeric;
 }
 
 function asNumber(value) {
@@ -1369,4 +1405,46 @@ export async function fetchPlayersHittingStreaksByIds(playerIds, season) {
   );
 
   return Object.fromEntries(results);
+}
+
+export async function fetchHitterGameLogs(playerId, season) {
+  if (!playerId) {
+    return [];
+  }
+
+  const cacheKey = `${playerId}-${season}`;
+  const cached = playerHittingGameLogsCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const url = new URL(`${PEOPLE_BASE_URL}/${playerId}`);
+  url.searchParams.set(
+    "hydrate",
+    `stats(group=[hitting],type=[gameLog],season=${season},sportId=1)`
+  );
+
+  try {
+    const response = await fetch(url.toString());
+    if (!response.ok) {
+      playerHittingGameLogsCache.set(cacheKey, []);
+      return [];
+    }
+    const payload = await response.json();
+    const splits = payload.people?.[0]?.stats?.[0]?.splits ?? [];
+    const normalized = splits
+      .map((split) => ({
+        gamePk: split?.game?.gamePk ?? null,
+        gameDate: split?.date ?? "",
+        hits: Number(split?.stat?.hits ?? 0),
+        baseOnBalls: Number(split?.stat?.baseOnBalls ?? 0),
+        hitByPitch: Number(split?.stat?.hitByPitch ?? 0)
+      }))
+      .filter((row) => row.gamePk);
+    playerHittingGameLogsCache.set(cacheKey, normalized);
+    return normalized;
+  } catch (error) {
+    playerHittingGameLogsCache.set(cacheKey, []);
+    return [];
+  }
 }
