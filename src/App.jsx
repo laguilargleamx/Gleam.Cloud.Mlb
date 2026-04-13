@@ -13,15 +13,14 @@ import {
   fetchPitcherErasByIds,
   fetchPitcherStrikeoutsPerGameByIds,
   getTeamAbbreviation,
+  getTeamLogoUrl,
   fetchBackendSession,
   fetchRecommendationHistoryFromBackend,
   loginToBackend,
-  logoutFromBackend,
   pruneSampleRecommendationHistoryFromBackend,
   upsertRecommendationHistoryToBackend,
   setBackendAccessToken
 } from "./api/mlbApi";
-import DateFilter from "./components/DateFilter";
 import GamesList from "./components/GamesList";
 
 const APP_DATA_CACHE_PREFIX = "mlb-app-data-cache-v1";
@@ -408,6 +407,31 @@ function addDays(isoDate, daysToAdd) {
   return `${nextYear}-${nextMonth}-${nextDay}`;
 }
 
+function buildSelectableDates(minDate, maxDate) {
+  const dates = [];
+  let cursor = new Date(`${minDate}T00:00:00`);
+  const end = new Date(`${maxDate}T00:00:00`);
+  while (cursor <= end) {
+    const year = cursor.getFullYear();
+    const month = `${cursor.getMonth() + 1}`.padStart(2, "0");
+    const day = `${cursor.getDate()}`.padStart(2, "0");
+    dates.push(`${year}-${month}-${day}`);
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return dates;
+}
+
+function formatDateOption(isoDate) {
+  const date = new Date(`${isoDate}T00:00:00`);
+  if (Number.isNaN(date.getTime())) {
+    return isoDate;
+  }
+  return date.toLocaleDateString("es-ES", {
+    day: "numeric",
+    month: "short"
+  });
+}
+
 function hasGameStarted(game) {
   const startTime = new Date(game?.gameDate ?? "").getTime();
   if (!startTime || Number.isNaN(startTime)) {
@@ -432,6 +456,17 @@ function getMatchTagLabel(game) {
   const away = getTeamAbbreviation(awayTeam);
   const home = getTeamAbbreviation(homeTeam);
   return `${away} vs ${home}`;
+}
+
+function getMatchTimeLabel(game) {
+  const gameTime = new Date(game?.gameDate ?? "").getTime();
+  if (!gameTime || Number.isNaN(gameTime)) {
+    return "--:--";
+  }
+  return new Date(gameTime).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit"
+  });
 }
 
 function getMatchPriority(game) {
@@ -671,6 +706,8 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
   const [activeMainView, setActiveMainView] = useState("games");
+  const tickerStripRef = useRef(null);
+  const [canScrollTickerRight, setCanScrollTickerRight] = useState(false);
   const [topPicksLoading, setTopPicksLoading] = useState(false);
   const [topPicksError, setTopPicksError] = useState("");
   const [topPicks, setTopPicks] = useState({
@@ -1133,9 +1170,10 @@ export default function App() {
     };
   }, [selectedDate, refreshSeed]);
 
-  const subtitle = useMemo(() => {
-    return `Mostrando juegos para ${selectedDate}`;
-  }, [selectedDate]);
+  const selectableDates = useMemo(
+    () => buildSelectableDates(minSelectableDate, maxSelectableDate),
+    [minSelectableDate, maxSelectableDate]
+  );
 
   const matchFilterOptions = useMemo(() => {
     return [...games]
@@ -1151,6 +1189,13 @@ export default function App() {
       .map((game) => ({
         id: String(game?.gamePk),
         label: getMatchTagLabel(game),
+        timeLabel: getMatchTimeLabel(game),
+        awayAbbr: getTeamAbbreviation(game?.teams?.away?.team),
+        homeAbbr: getTeamAbbreviation(game?.teams?.home?.team),
+        awayLogo: getTeamLogoUrl(game?.teams?.away?.team),
+        homeLogo: getTeamLogoUrl(game?.teams?.home?.team),
+        awayRecord: `${game?.teams?.away?.leagueRecord?.wins ?? "-"}-${game?.teams?.away?.leagueRecord?.losses ?? "-"}`,
+        homeRecord: `${game?.teams?.home?.leagueRecord?.wins ?? "-"}-${game?.teams?.home?.leagueRecord?.losses ?? "-"}`,
         isLive: isGameLive(game),
         isUpcoming: !hasGameStarted(game)
       }));
@@ -1162,9 +1207,13 @@ export default function App() {
       filteredGames = filteredGames.filter((game) => !hasGameStarted(game));
     }
     if (selectedMatchFilter !== "all") {
-      filteredGames = filteredGames.filter((game) => {
-        return String(game?.gamePk) === selectedMatchFilter;
-      });
+      const selectedGame = filteredGames.find((game) => String(game?.gamePk) === selectedMatchFilter);
+      if (selectedGame) {
+        filteredGames = [
+          selectedGame,
+          ...filteredGames.filter((game) => String(game?.gamePk) !== selectedMatchFilter)
+        ];
+      }
     }
     return filteredGames;
   }, [games, gamesViewMode, selectedMatchFilter]);
@@ -1261,19 +1310,6 @@ export default function App() {
     }
   }
 
-  async function handleLogout() {
-    try {
-      await logoutFromBackend();
-    } catch (error) {
-      // Best effort server-side invalidation.
-    } finally {
-      clearAuthSession();
-      setBackendAccessToken("");
-      setAuthSession(null);
-      setHistoryLoaded(false);
-    }
-  }
-
   const historyDates = useMemo(() => {
     return [...new Set(recommendationHistory.map((entry) => entry?.gameDate).filter(Boolean))].sort(
       (a, b) => `${b}`.localeCompare(`${a}`)
@@ -1298,7 +1334,13 @@ export default function App() {
     if (!historySelectedDate) {
       return [];
     }
-    return recommendationHistory.filter((entry) => entry?.gameDate === historySelectedDate);
+    return recommendationHistory.filter((entry) => {
+      if (entry?.gameDate !== historySelectedDate) {
+        return false;
+      }
+      const recommendation = `${entry?.recommendation || ""}`.toLowerCase().trim();
+      return recommendation !== "nula";
+    });
   }, [recommendationHistory, historySelectedDate]);
 
   const [historyPickGroup, setHistoryPickGroup] = useState("strikeouts");
@@ -1326,6 +1368,39 @@ export default function App() {
 
   const selectedHistoryDateIndex = historyDates.indexOf(historySelectedDate);
 
+  useEffect(() => {
+    if (activeMainView === "history") {
+      setCanScrollTickerRight(false);
+      return undefined;
+    }
+    const node = tickerStripRef.current;
+    if (!node) {
+      setCanScrollTickerRight(false);
+      return undefined;
+    }
+
+    function updateTickerScrollState() {
+      const remaining = node.scrollWidth - node.clientWidth - node.scrollLeft;
+      setCanScrollTickerRight(remaining > 6);
+    }
+
+    updateTickerScrollState();
+    node.addEventListener("scroll", updateTickerScrollState);
+    window.addEventListener("resize", updateTickerScrollState);
+    return () => {
+      node.removeEventListener("scroll", updateTickerScrollState);
+      window.removeEventListener("resize", updateTickerScrollState);
+    };
+  }, [activeMainView, matchFilterOptions.length, selectedDate]);
+
+  function handleTickerScrollRight() {
+    const node = tickerStripRef.current;
+    if (!node) {
+      return;
+    }
+    node.scrollBy({ left: 220, behavior: "smooth" });
+  }
+
   if (!isAuthenticated) {
     return (
       <main className="app auth-page">
@@ -1336,21 +1411,75 @@ export default function App() {
 
   return (
     <main className="app">
-      <div className="app-header">
-        <h1>MLB Schedule Viewer</h1>
-        <button type="button" className="logout-button" onClick={handleLogout}>
-          Cerrar sesion
-        </button>
+      <div className="match-ticker-header">
+        <div
+          ref={tickerStripRef}
+          className="match-filter-strip match-filter-strip-top"
+          role="tablist"
+          aria-label="Filtro por match"
+        >
+          <div className="match-filter-tag match-date-card">
+            <select
+              className="match-date-select"
+              value={selectedDate}
+              onChange={(event) => handleDateChange(event.target.value)}
+              disabled={loading}
+            >
+              {selectableDates.map((isoDate) => (
+                <option key={isoDate} value={isoDate}>
+                  {formatDateOption(isoDate)}
+                </option>
+              ))}
+            </select>
+          </div>
+          {matchFilterOptions.map((match) => (
+            <button
+              key={match.id}
+              type="button"
+              className={`match-filter-tag match-ticker-card ${
+                selectedMatchFilter === match.id ? "active" : ""
+              }`}
+              onClick={() =>
+                setSelectedMatchFilter((current) => (current === match.id ? "all" : match.id))
+              }
+              title={match.isLive ? "En vivo" : match.isUpcoming ? "Proximo" : undefined}
+            >
+              <div className="match-ticker-time">{match.timeLabel}</div>
+              <div className="match-ticker-row">
+                {match.isLive ? <span className="match-status-dot live" aria-hidden="true" /> : null}
+                {match.awayLogo ? (
+                  <img className="match-team-logo" src={match.awayLogo} alt={`${match.awayAbbr} logo`} />
+                ) : (
+                  <span className="match-team-fallback">{match.awayAbbr.slice(0, 1)}</span>
+                )}
+                <strong>{match.awayAbbr}</strong>
+                <small>{match.awayRecord}</small>
+              </div>
+              <div className="match-ticker-row">
+                {match.isLive ? <span className="match-status-dot live" aria-hidden="true" /> : null}
+                {match.homeLogo ? (
+                  <img className="match-team-logo" src={match.homeLogo} alt={`${match.homeAbbr} logo`} />
+                ) : (
+                  <span className="match-team-fallback">{match.homeAbbr.slice(0, 1)}</span>
+                )}
+                <strong>{match.homeAbbr}</strong>
+                <small>{match.homeRecord}</small>
+              </div>
+            </button>
+          ))}
+        </div>
+        {canScrollTickerRight ? (
+          <button
+            type="button"
+            className="match-ticker-arrow"
+            onClick={handleTickerScrollRight}
+            aria-label="Desplazar juegos hacia la derecha"
+          >
+            ›
+          </button>
+        ) : null}
       </div>
-      <p>{subtitle}</p>
-      <DateFilter
-        value={selectedDate}
-        onChange={handleDateChange}
-        loading={loading}
-        minDate={minSelectableDate}
-        maxDate={maxSelectableDate}
-      />
-      <div className="games-view-toggle" role="tablist" aria-label="Vista principal">
+      <div className="games-view-toggle main-nav" role="tablist" aria-label="Vista principal">
         <button
           type="button"
           className={`games-view-button ${activeMainView === "games" ? "active" : ""}`}
@@ -1522,7 +1651,7 @@ export default function App() {
       ) : null}
       {activeMainView !== "history" ? (
         <>
-      <div className="games-view-toggle" role="tablist" aria-label="Filtro de juegos">
+      <div className="games-view-toggle games-controls" role="tablist" aria-label="Filtro de juegos">
         <button
           type="button"
           className={`games-view-button ${gamesViewMode === "upcoming" ? "active" : ""}`}
@@ -1547,32 +1676,6 @@ export default function App() {
         >
           {loading ? "Refrescando data..." : "Refrescar data (fecha)"}
         </button>
-      </div>
-      <div className="match-filter-strip" role="tablist" aria-label="Filtro por match">
-        <button
-          type="button"
-          className={`match-filter-tag ${selectedMatchFilter === "all" ? "active" : ""}`}
-          onClick={() => setSelectedMatchFilter("all")}
-        >
-          Todos los matches
-        </button>
-        {matchFilterOptions.map((match) => (
-          <button
-            key={match.id}
-            type="button"
-            className={`match-filter-tag ${selectedMatchFilter === match.id ? "active" : ""}`}
-            onClick={() => setSelectedMatchFilter(match.id)}
-            title={match.isLive ? "En vivo" : match.isUpcoming ? "Proximo" : undefined}
-          >
-            <span
-              className={`match-status-dot ${
-                match.isLive ? "live" : match.isUpcoming ? "upcoming" : ""
-              }`}
-              aria-hidden="true"
-            />
-            {match.label}
-          </button>
-        ))}
       </div>
       {error ? <p className="error">{error}</p> : null}
       {loading ? (

@@ -138,12 +138,26 @@ body {
 }
 
 .date-filter {
-  display: block;
-  margin-bottom: 1rem;
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 0.7rem;
   border: 1px solid #d1d5db;
   border-radius: 12px;
-  padding: 0.4rem 0.45rem;
+  padding: 0.2rem 0.4rem;
   background: #ffffff;
+}
+
+.date-select {
+  border: 0;
+  background: transparent;
+  font-size: 0.92rem;
+  font-weight: 600;
+  padding: 0.25rem 0.3rem;
+  color: #111827;
+}
+
+.date-select:focus {
+  outline: none;
 }
 
 .games-view-toggle {
@@ -155,33 +169,69 @@ body {
 }
 
 .games-view-button {
-  border: 1px solid #d1d5db;
+  border: 1px solid transparent;
   background: #ffffff;
-  border-radius: 8px;
-  padding: 0.38rem 0.72rem;
+  border-radius: 10px;
+  padding: 0.4rem 0.82rem;
   font-size: 0.86rem;
   cursor: pointer;
+  transition: all 0.2s ease;
 }
 
 .games-view-button.active {
-  border-color: #6b7280;
-  background: #f3f4f6;
+  border-color: #111827;
+  background: #111827;
+  color: #ffffff;
+}
+
+.games-view-button:hover {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+}
+
+.games-view-toggle.main-nav {
+  display: inline-flex;
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  border-radius: 12px;
+  padding: 0.28rem;
+  gap: 0.35rem;
+}
+
+.games-view-toggle.main-nav .games-view-button {
+  border-radius: 9px;
+}
+
+.games-view-toggle.games-controls .games-view-button {
+  border-color: #d1d5db;
+}
+
+.games-view-toggle.games-controls .games-view-button:last-child {
+  border-color: #111827;
+  background: #111827;
+  color: #ffffff;
+}
+
+.games-view-toggle.games-controls .games-view-button:last-child:hover {
+  background: #1f2937;
+  border-color: #1f2937;
 }
 
 .match-filter-strip {
   margin: 0 0 0.8rem;
   display: flex;
-  gap: 0.45rem;
+  gap: 0;
   overflow-x: auto;
-  padding-bottom: 0.2rem;
+  padding-bottom: 0;
   scrollbar-width: thin;
 }
 
 .match-filter-tag {
-  border: 1px solid #d1d5db;
+  border: 0;
+  border-right: 1px solid #d1d5db;
   background: #ffffff;
-  border-radius: 8px;
-  padding: 0.34rem 0.6rem;
+  border-radius: 0;
+  padding: 0.34rem 0.55rem;
   font-size: 0.86rem;
   color: inherit;
   cursor: pointer;
@@ -192,8 +242,101 @@ body {
 }
 
 .match-filter-tag.active {
-  border-color: #6b7280;
   background: #f3f4f6;
+}
+
+.match-ticker-card {
+  min-width: 110px;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 0.18rem;
+  padding: 0.36rem 0.46rem;
+}
+
+.match-ticker-time {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #374151;
+}
+
+.match-ticker-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.match-ticker-row strong {
+  font-size: 0.8rem;
+  min-width: 1.85rem;
+}
+
+.match-ticker-row small {
+  font-size: 0.72rem;
+  color: #6b7280;
+}
+
+.match-team-logo {
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+}
+
+.match-team-fallback {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 1px solid #d1d5db;
+  display: grid;
+  place-items: center;
+  font-size: 0.6rem;
+  color: #4b5563;
+}
+
+.match-filter-strip-top {
+  margin-top: 0.2rem;
+  margin-bottom: 0.8rem;
+  border: 1px solid #d1d5db;
+  border-radius: 12px;
+  background: #ffffff;
+  overflow: auto hidden;
+}
+
+.match-ticker-header {
+  position: relative;
+}
+
+.match-ticker-arrow {
+  position: absolute;
+  right: 0.2rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 28px;
+  height: 44px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #334155;
+  cursor: pointer;
+  font-size: 1.4rem;
+  line-height: 1;
+}
+
+.match-date-card {
+  flex: 0 0 auto;
+  min-width: 86px;
+  padding: 0.3rem 0.35rem;
+}
+
+.match-date-select {
+  border: 0;
+  background: transparent;
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: #374151;
+}
+
+.match-date-select:focus {
+  outline: none;
 }
 
 .history-panel {
@@ -330,16 +473,10 @@ body {
 
 .match-status-dot.live {
   background: #ef4444;
-  box-shadow:
-    0 0 0 2px rgb(239 68 68 / 20%),
-    0 0 10px rgb(239 68 68 / 85%);
 }
 
 .match-status-dot.upcoming {
-  background: #3b82f6;
-  box-shadow:
-    0 0 0 2px rgb(59 130 246 / 20%),
-    0 0 8px rgb(59 130 246 / 75%);
+  background: #9ca3af;
 }
 
 .date-strip {

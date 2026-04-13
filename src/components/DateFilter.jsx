@@ -16,14 +16,15 @@ function buildSelectableDates(minDate, maxDate) {
   return dates;
 }
 
-function formatDateBlock(isoDate) {
+function formatDateLabel(isoDate) {
   const date = new Date(`${isoDate}T00:00:00`);
-  const top = date.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric"
+  if (Number.isNaN(date.getTime())) {
+    return isoDate;
+  }
+  return date.toLocaleDateString("es-ES", {
+    day: "numeric",
+    month: "short"
   });
-  const bottom = date.toLocaleDateString(undefined, { weekday: "short" });
-  return { top, bottom };
 }
 
 export default function DateFilter({ value, onChange, loading, minDate, maxDate }) {
@@ -34,25 +35,18 @@ export default function DateFilter({ value, onChange, loading, minDate, maxDate 
 
   return (
     <div className="date-filter" aria-label="Selector de fecha">
-      <div className="date-strip">
-        {selectableDates.map((isoDate) => {
-          const { top, bottom } = formatDateBlock(isoDate);
-          const isActive = value === isoDate;
-
-          return (
-            <button
-              key={isoDate}
-              type="button"
-              className={`date-pill ${isActive ? "active" : ""}`}
-              onClick={() => onChange(isoDate)}
-              disabled={loading}
-            >
-              <span>{top}</span>
-              <strong>{bottom}</strong>
-            </button>
-          );
-        })}
-      </div>
+      <select
+        className="date-select"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        disabled={loading}
+      >
+        {selectableDates.map((isoDate) => (
+          <option key={isoDate} value={isoDate}>
+            {formatDateLabel(isoDate)}
+          </option>
+        ))}
+      </select>
     </div>
   );
 }
