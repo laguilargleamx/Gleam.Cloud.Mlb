@@ -7,9 +7,11 @@ import {
   fetchPitcherStrikeoutLinesForGame,
   fetchPitcherStrikeoutLinesByGames,
   fetchPitcherHandednessByIds,
+  fetchGameWeatherByGames,
   fetchMlbScheduleByDate,
   fetchPlayersHittingStatsByIds,
   fetchPlayersHittingStreaksByIds,
+  fetchPlayersVsPitcherStatsByIds,
   fetchPitcherErasByIds,
   fetchPitcherStrikeoutsPerGameByIds,
   getTeamAbbreviation,
@@ -355,7 +357,7 @@ function clampProbability(value, min = 0, max = 1) {
   return Math.min(Math.max(value, min), max);
 }
 
-function estimateHitProbability(stats, streaks, opposingPitcherHandedness) {
+function estimateHitProbability(stats, streaks, opposingPitcherHandedness, vsPitcherStats) {
   const avg = Number(stats?.avg);
   const ops = Number(stats?.ops);
   const hitStreak = Number(streaks?.hitStreak || 0);
@@ -367,10 +369,26 @@ function estimateHitProbability(stats, streaks, opposingPitcherHandedness) {
   const streakAdjustment = clampProbability(hitStreak * 0.008 + singleStreak * 0.006, 0, 0.06);
   const handAdjustment = handText.startsWith("zur") ? 0.005 : 0;
 
-  return clampProbability(baseAvg + opsAdjustment + streakAdjustment + handAdjustment, 0.14, 0.8);
+  const baseProbability = clampProbability(
+    baseAvg + opsAdjustment + streakAdjustment + handAdjustment,
+    0.14,
+    0.8
+  );
+  const atBatsVsPitcher = Number(vsPitcherStats?.atBats || 0);
+  const hitsVsPitcher = Number(vsPitcherStats?.hits || 0);
+  if (atBatsVsPitcher <= 0 || hitsVsPitcher < 0) {
+    return baseProbability;
+  }
+  const rawVsHitRate = clampProbability(hitsVsPitcher / atBatsVsPitcher, 0.05, 0.95);
+  const sampleWeight = clampProbability((atBatsVsPitcher - 2) / 18, 0, 0.3);
+  return clampProbability(
+    baseProbability * (1 - sampleWeight) + rawVsHitRate * sampleWeight,
+    0.14,
+    0.8
+  );
 }
 
-function estimateOnBaseProbability(stats, streaks, hitProbability) {
+function estimateOnBaseProbability(stats, streaks, hitProbability, vsPitcherStats) {
   const obp = Number(stats?.obp);
   const hitStreak = Number(streaks?.hitStreak || 0);
   const xbhStreak = Number(streaks?.xbhStreak || 0);
@@ -378,7 +396,22 @@ function estimateOnBaseProbability(stats, streaks, hitProbability) {
   const baseObp =
     Number.isFinite(obp) && obp > 0 ? obp : clampProbability(Number(hitProbability) + 0.07, 0.22, 0.42);
   const streakAdjustment = clampProbability(hitStreak * 0.006 + xbhStreak * 0.003, 0, 0.05);
-  return clampProbability(baseObp + streakAdjustment, 0.2, 0.9);
+  const baseProbability = clampProbability(baseObp + streakAdjustment, 0.2, 0.9);
+  const plateAppearancesVsPitcher = Number(vsPitcherStats?.plateAppearances || 0);
+  if (plateAppearancesVsPitcher <= 0) {
+    return baseProbability;
+  }
+  const onBaseEvents =
+    Number(vsPitcherStats?.hits || 0) +
+    Number(vsPitcherStats?.walks || 0) +
+    Number(vsPitcherStats?.hitByPitch || 0);
+  const rawVsOnBaseRate = clampProbability(onBaseEvents / plateAppearancesVsPitcher, 0.08, 0.98);
+  const sampleWeight = clampProbability((plateAppearancesVsPitcher - 3) / 20, 0, 0.32);
+  return clampProbability(
+    baseProbability * (1 - sampleWeight) + rawVsOnBaseRate * sampleWeight,
+    0.2,
+    0.9
+  );
 }
 
 function formatPercent(probability) {
@@ -696,6 +729,7 @@ export default function App() {
   const [pitcherStrikeoutLinesById, setPitcherStrikeoutLinesById] = useState({});
   const [pitcherStrikeoutValueById, setPitcherStrikeoutValueById] = useState({});
   const [pitcherHandednessById, setPitcherHandednessById] = useState({});
+  const [gameWeatherByGamePk, setGameWeatherByGamePk] = useState({});
   const [oddsLoading, setOddsLoading] = useState(false);
   const [gamesViewMode, setGamesViewMode] = useState("all");
   const [selectedMatchFilter, setSelectedMatchFilter] = useState("all");
@@ -924,6 +958,7 @@ export default function App() {
               eventLabel,
               playerId: player.playerId,
               playerName: player.fullName,
+              opposingPitcherId: Number(homePitcherId || 0),
               opposingPitcherHandedness: awayOpposingHand
             });
           }
@@ -938,29 +973,61 @@ export default function App() {
               eventLabel,
               playerId: player.playerId,
               playerName: player.fullName,
+              opposingPitcherId: Number(awayPitcherId || 0),
               opposingPitcherHandedness: homeOpposingHand
             });
           }
         }
 
         const uniqueHitterIds = [...new Set(hitterCandidates.map((candidate) => candidate.playerId))];
+        const hitterIdsByPitcherId = hitterCandidates.reduce((acc, candidate) => {
+          const pitcherId = Number(candidate?.opposingPitcherId || 0);
+          const playerId = Number(candidate?.playerId || 0);
+          if (!pitcherId || !playerId) {
+            return acc;
+          }
+          if (!acc[pitcherId]) {
+            acc[pitcherId] = new Set();
+          }
+          acc[pitcherId].add(playerId);
+          return acc;
+        }, {});
         const season = selectedDate.split("-")[0];
-        const [statsByPlayerId, streaksByPlayerId] = await Promise.all([
+        const [statsByPlayerId, streaksByPlayerId, vsPitcherEntries] = await Promise.all([
           fetchPlayersHittingStatsByIds(uniqueHitterIds, season),
-          fetchPlayersHittingStreaksByIds(uniqueHitterIds, season)
+          fetchPlayersHittingStreaksByIds(uniqueHitterIds, season),
+          Promise.all(
+            Object.entries(hitterIdsByPitcherId).map(async ([pitcherId, playerIdsSet]) => {
+              const map = await fetchPlayersVsPitcherStatsByIds(
+                [...playerIdsSet],
+                Number(pitcherId)
+              );
+              return [pitcherId, map];
+            })
+          )
         ]);
+        const vsPitcherStatsByPitcherId = Object.fromEntries(vsPitcherEntries);
 
         const hitCandidates = [];
         const onBaseCandidates = [];
         for (const candidate of hitterCandidates) {
           const stats = statsByPlayerId?.[candidate.playerId];
           const streaks = streaksByPlayerId?.[candidate.playerId];
+          const vsPitcherStats =
+            vsPitcherStatsByPitcherId?.[`${candidate.opposingPitcherId}`]?.[candidate.playerId] ??
+            null;
           const hitProbability = estimateHitProbability(
             stats,
             streaks,
-            candidate.opposingPitcherHandedness
+            candidate.opposingPitcherHandedness,
+            vsPitcherStats
           );
-          const onBaseProbability = estimateOnBaseProbability(stats, streaks, hitProbability);
+          const onBaseProbability = estimateOnBaseProbability(
+            stats,
+            streaks,
+            hitProbability,
+            vsPitcherStats
+          );
           hitCandidates.push({
             key: `hit-${candidate.key}`,
             gamePk: candidate.gamePk,
@@ -1083,6 +1150,7 @@ export default function App() {
       setPitcherStrikeoutLinesById(snapshot?.pitcherStrikeoutLinesById ?? {});
       setPitcherStrikeoutValueById(snapshot?.pitcherStrikeoutValueById ?? {});
       setPitcherHandednessById(snapshot?.pitcherHandednessById ?? {});
+      setGameWeatherByGamePk(snapshot?.gameWeatherByGamePk ?? {});
     }
 
     async function loadGames() {
@@ -1110,12 +1178,13 @@ export default function App() {
           game.teams?.home?.probablePitcher?.id
         ]);
         const season = selectedDate.split("-")[0];
-        const [erasMap, strikeoutsPerGameMap, strikeoutLinesMap, handednessMap] =
+        const [erasMap, strikeoutsPerGameMap, strikeoutLinesMap, handednessMap, weatherByGamePk] =
           await Promise.all([
             fetchPitcherErasByIds(pitcherIds, season),
             fetchPitcherStrikeoutsPerGameByIds(pitcherIds, season),
             fetchPitcherStrikeoutLinesByGames(fetchedGames),
-            fetchPitcherHandednessByIds(pitcherIds)
+            fetchPitcherHandednessByIds(pitcherIds),
+            fetchGameWeatherByGames(fetchedGames, { forceRefresh })
           ]);
         const strikeoutValueMap = await evaluatePitcherStrikeoutValueByGames(
           fetchedGames,
@@ -1130,7 +1199,8 @@ export default function App() {
             pitcherStrikeoutsPerGameById: strikeoutsPerGameMap,
             pitcherStrikeoutLinesById: strikeoutLinesMap,
             pitcherStrikeoutValueById: strikeoutValueMap,
-            pitcherHandednessById: handednessMap
+            pitcherHandednessById: handednessMap,
+            gameWeatherByGamePk: weatherByGamePk
           };
           applyLoadedData(nextSnapshot);
           writeAppDataCache(selectedDate, nextSnapshot);
@@ -1155,6 +1225,7 @@ export default function App() {
           setPitcherStrikeoutLinesById({});
           setPitcherStrikeoutValueById({});
           setPitcherHandednessById({});
+          setGameWeatherByGamePk({});
           setOddsLoading(false);
         }
       } finally {
@@ -1266,7 +1337,8 @@ export default function App() {
         pitcherStrikeoutsPerGameById,
         pitcherStrikeoutLinesById: nextLinesByPitcherId,
         pitcherStrikeoutValueById: nextStrikeoutValueById,
-        pitcherHandednessById
+        pitcherHandednessById,
+        gameWeatherByGamePk
       });
 
       return result.debug;
@@ -1688,6 +1760,7 @@ export default function App() {
           pitcherStrikeoutLinesById={pitcherStrikeoutLinesById}
           pitcherStrikeoutValueById={pitcherStrikeoutValueById}
           pitcherHandednessById={pitcherHandednessById}
+          gameWeatherByGamePk={gameWeatherByGamePk}
           oddsLoading={oddsLoading}
           onRefreshOddsForGame={handleRefreshOddsForGame}
         />

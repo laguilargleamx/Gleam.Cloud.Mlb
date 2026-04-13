@@ -27,6 +27,10 @@ ODDS_API_BASE_URL = (os.getenv("THE_ODDS_API_BASE_URL") or "https://api.the-odds
 ODDS_API_KEY = (os.getenv("THE_ODDS_API_KEY") or "").strip()
 ODDS_CACHE_TTL_MINUTES = int(os.getenv("ODDS_CACHE_TTL_MINUTES") or "10")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("ODDS_HTTP_TIMEOUT_SECONDS") or "12")
+MLB_VENUE_BASE_URL = "https://statsapi.mlb.com/api/v1/venues"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_CACHE_TTL_SECONDS = int(os.getenv("WEATHER_CACHE_TTL_SECONDS") or "1800")
+VENUE_CACHE_TTL_SECONDS = int(os.getenv("VENUE_CACHE_TTL_SECONDS") or "43200")
 APP_AUTH_USERNAME = (os.getenv("APP_AUTH_USERNAME") or "admin").strip()
 APP_AUTH_PASSWORD_HASH = (os.getenv("APP_AUTH_PASSWORD_HASH") or "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD") or "mlb2026"
@@ -53,6 +57,11 @@ class RecommendationHistoryUpsertRequest(BaseModel):
     entries: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class WeatherByGamesRequest(BaseModel):
+    games: list[dict[str, Any]] = Field(default_factory=list)
+    forceRefresh: bool = False
+
+
 app = FastAPI(title="Gleam MLB Odds Backend", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -62,6 +71,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 bearer_scheme = HTTPBearer(auto_error=False)
+weather_by_game_cache: dict[str, dict[str, Any]] = {}
+venue_context_cache: dict[int, dict[str, Any]] = {}
 
 
 def utc_now() -> datetime:
@@ -310,6 +321,188 @@ def normalize_pick_domain(value: Any) -> str:
     if normalized in {"strikeouts", "hits", "onbase"}:
         return normalized
     return "strikeouts"
+
+
+def extract_game_date(game: dict[str, Any]) -> str:
+    raw = str(game.get("officialDate") or game.get("gameDate") or "").strip()
+    return raw[:10] if raw else ""
+
+
+def is_probably_indoor(roof_type: Any) -> bool:
+    normalized = str(roof_type or "").strip().lower()
+    if not normalized:
+        return False
+    return "dome" in normalized or "closed" in normalized
+
+
+def parse_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric == numeric else None
+
+
+def parse_hourly_time_to_utc(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def build_weather_summary(node: dict[str, Any]) -> str:
+    temp_c = parse_float(node.get("temperatureC"))
+    wind_kph = parse_float(node.get("windSpeedKph"))
+    precip = parse_float(node.get("precipitationProbability"))
+    chunks: list[str] = []
+    if temp_c is not None:
+        chunks.append(f"{temp_c:.1f}C")
+    if wind_kph is not None:
+        chunks.append(f"Viento {wind_kph:.0f} km/h")
+    if precip is not None:
+        chunks.append(f"Lluvia {precip:.0f}%")
+    return " | ".join(chunks)
+
+
+async def fetch_venue_context(venue_id: int) -> dict[str, Any] | None:
+    if not venue_id:
+        return None
+    cached = venue_context_cache.get(venue_id)
+    now = utc_now()
+    if cached and isinstance(cached.get("expiresAt"), datetime) and cached["expiresAt"] > now:
+        return cached.get("value")
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        response = await client.get(f"{MLB_VENUE_BASE_URL}/{venue_id}")
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+    venue_node = (payload.get("venues") or [None])[0] or {}
+    location = venue_node.get("location") or {}
+    coords = location.get("defaultCoordinates") or {}
+    context = {
+        "venueId": venue_id,
+        "venueName": venue_node.get("name") or "",
+        "roofType": venue_node.get("roofType") or "",
+        "latitude": parse_float(coords.get("latitude")),
+        "longitude": parse_float(coords.get("longitude")),
+    }
+    venue_context_cache[venue_id] = {
+        "expiresAt": now + timedelta(seconds=max(300, VENUE_CACHE_TTL_SECONDS)),
+        "value": context,
+    }
+    return context
+
+
+async def fetch_open_meteo_weather(latitude: float, longitude: float, game_time_iso: str) -> dict[str, Any] | None:
+    if latitude is None or longitude is None or not game_time_iso:
+        return None
+    try:
+        game_dt = datetime.fromisoformat(str(game_time_iso).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+    start_date = game_dt.date().isoformat()
+    end_date = start_date
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": "temperature_2m,apparent_temperature,precipitation_probability,wind_speed_10m,wind_direction_10m,weather_code",
+        "timezone": "UTC",
+        "start_date": start_date,
+        "end_date": end_date,
+        "wind_speed_unit": "kmh",
+    }
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        response = await client.get(OPEN_METEO_FORECAST_URL, params=params)
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+
+    hourly = payload.get("hourly") or {}
+    times = hourly.get("time") or []
+    if not times:
+        return None
+    nearest_index = -1
+    nearest_diff = None
+    for index, raw_time in enumerate(times):
+        parsed_time = parse_hourly_time_to_utc(raw_time)
+        if parsed_time is None:
+            continue
+        diff = abs((parsed_time - game_dt).total_seconds())
+        if nearest_diff is None or diff < nearest_diff:
+            nearest_diff = diff
+            nearest_index = index
+    if nearest_index < 0:
+        return None
+
+    def read_hourly(metric: str) -> Any:
+        values = hourly.get(metric) or []
+        if nearest_index >= len(values):
+            return None
+        return values[nearest_index]
+
+    return {
+        "temperatureC": parse_float(read_hourly("temperature_2m")),
+        "apparentTemperatureC": parse_float(read_hourly("apparent_temperature")),
+        "precipitationProbability": parse_float(read_hourly("precipitation_probability")),
+        "windSpeedKph": parse_float(read_hourly("wind_speed_10m")),
+        "windDirectionDeg": parse_float(read_hourly("wind_direction_10m")),
+        "weatherCode": read_hourly("weather_code"),
+        "sampledAtUtc": times[nearest_index],
+    }
+
+
+async def resolve_game_weather(game: dict[str, Any], force_refresh: bool) -> dict[str, Any] | None:
+    game_pk = int(game.get("gamePk") or 0)
+    if not game_pk:
+        return None
+    cache_key = str(game_pk)
+    now = utc_now()
+    cached = weather_by_game_cache.get(cache_key)
+    if (
+        not force_refresh
+        and cached
+        and isinstance(cached.get("expiresAt"), datetime)
+        and cached["expiresAt"] > now
+    ):
+        return cached.get("value")
+
+    venue_id = int(((game.get("venue") or {}).get("id")) or 0)
+    venue = await fetch_venue_context(venue_id)
+    lat = parse_float((venue or {}).get("latitude"))
+    lon = parse_float((venue or {}).get("longitude"))
+    roof_type = str((venue or {}).get("roofType") or "").strip()
+    game_time_iso = str(game.get("gameDate") or "").strip()
+    weather = await fetch_open_meteo_weather(lat, lon, game_time_iso)
+    if not weather:
+        return None
+
+    result = {
+        "temperatureC": weather.get("temperatureC"),
+        "apparentTemperatureC": weather.get("apparentTemperatureC"),
+        "precipitationProbability": weather.get("precipitationProbability"),
+        "windSpeedKph": weather.get("windSpeedKph"),
+        "windDirectionDeg": weather.get("windDirectionDeg"),
+        "weatherCode": weather.get("weatherCode"),
+        "sampledAtUtc": weather.get("sampledAtUtc"),
+        "roofType": roof_type,
+        "isIndoorLikely": is_probably_indoor(roof_type),
+        "summary": build_weather_summary(weather),
+        "source": "open-meteo",
+        "updatedAt": to_unix_ms(now),
+    }
+    weather_by_game_cache[cache_key] = {
+        "expiresAt": now + timedelta(seconds=max(120, WEATHER_CACHE_TTL_SECONDS)),
+        "value": result,
+    }
+    return result
 
 
 async def fetch_odds_json(path: str, params: dict[str, Any]) -> Any:
@@ -898,6 +1091,32 @@ def recommendations_history_prune_samples(
         raise HTTPException(status_code=500, detail=f"Unexpected history backend error: {exc}") from exc
 
     return {"ok": True, "deleted": deleted}
+
+
+@app.post("/weather/by-games")
+async def weather_by_games(
+    req: WeatherByGamesRequest,
+    _auth_payload: dict[str, Any] = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    if not req.games:
+        return {"weatherByGamePk": {}}
+
+    weather_payload: dict[str, dict[str, Any]] = {}
+    try:
+        for game in req.games:
+            if not isinstance(game, dict):
+                continue
+            game_pk = int(game.get("gamePk") or 0)
+            if not game_pk:
+                continue
+            weather = await resolve_game_weather(game, req.forceRefresh)
+            if weather:
+                weather_payload[str(game_pk)] = weather
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected weather backend error: {exc}") from exc
+    return {"weatherByGamePk": weather_payload}
 
 
 @app.post("/odds/lines/by-games")

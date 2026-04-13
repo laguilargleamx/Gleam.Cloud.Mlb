@@ -17,9 +17,11 @@ const gameBoxscoreCache = new Map();
 const teamStrikeoutsByGameCache = new Map();
 const pitcherHandednessCache = new Map();
 const lineupCache = new Map();
+const gameWeatherCache = new Map();
 const playerHittingStatsCache = new Map();
 const playerHittingStreakCache = new Map();
 const playerHittingGameLogsCache = new Map();
+const hitterVsPitcherStatsCache = new Map();
 const pitcherStrikeoutLineCache = new Map();
 let backendAccessToken = "";
 
@@ -346,6 +348,81 @@ async function fetchBackendOddsJson(pathname, payload) {
     throw new Error(detail);
   }
   return response.json();
+}
+
+function normalizeBackendWeatherByGame(weatherByGamePk) {
+  if (!weatherByGamePk || typeof weatherByGamePk !== "object") {
+    return {};
+  }
+  return Object.entries(weatherByGamePk).reduce((acc, [gamePk, node]) => {
+    const normalizedGamePk = Number(gamePk);
+    if (!normalizedGamePk || !node || typeof node !== "object") {
+      return acc;
+    }
+    acc[normalizedGamePk] = {
+      temperatureC:
+        typeof node?.temperatureC === "number" ? node.temperatureC : Number(node?.temperatureC),
+      apparentTemperatureC:
+        typeof node?.apparentTemperatureC === "number"
+          ? node.apparentTemperatureC
+          : Number(node?.apparentTemperatureC),
+      precipitationProbability:
+        typeof node?.precipitationProbability === "number"
+          ? node.precipitationProbability
+          : Number(node?.precipitationProbability),
+      windSpeedKph:
+        typeof node?.windSpeedKph === "number" ? node.windSpeedKph : Number(node?.windSpeedKph),
+      windDirectionDeg:
+        typeof node?.windDirectionDeg === "number"
+          ? node.windDirectionDeg
+          : Number(node?.windDirectionDeg),
+      weatherCode: node?.weatherCode ?? null,
+      sampledAtUtc: node?.sampledAtUtc ?? "",
+      roofType: node?.roofType ?? "",
+      isIndoorLikely: Boolean(node?.isIndoorLikely),
+      summary: node?.summary ?? "",
+      source: node?.source ?? "open-meteo",
+      updatedAt: node?.updatedAt ?? Date.now()
+    };
+    return acc;
+  }, {});
+}
+
+export async function fetchGameWeatherByGames(games, { forceRefresh = false } = {}) {
+  if (!Array.isArray(games) || !games.length) {
+    return {};
+  }
+  const uniqueGameIds = [...new Set(games.map((game) => Number(game?.gamePk || 0)).filter(Boolean))];
+  const gamesForRequest = games.filter((game) => uniqueGameIds.includes(Number(game?.gamePk || 0)));
+  if (!gamesForRequest.length) {
+    return {};
+  }
+
+  if (!forceRefresh) {
+    const uncachedGames = gamesForRequest.filter((game) => !gameWeatherCache.has(Number(game?.gamePk || 0)));
+    if (!uncachedGames.length) {
+      return Object.fromEntries(
+        uniqueGameIds
+          .map((gamePk) => [gamePk, gameWeatherCache.get(gamePk)])
+          .filter(([, weather]) => Boolean(weather))
+      );
+    }
+  }
+
+  const payload = await fetchBackendOddsJson("/weather/by-games", {
+    games: gamesForRequest,
+    forceRefresh: Boolean(forceRefresh)
+  });
+  const normalized = normalizeBackendWeatherByGame(payload?.weatherByGamePk);
+  Object.entries(normalized).forEach(([gamePk, node]) => {
+    gameWeatherCache.set(Number(gamePk), node);
+  });
+
+  return Object.fromEntries(
+    uniqueGameIds
+      .map((gamePk) => [gamePk, gameWeatherCache.get(gamePk)])
+      .filter(([, weather]) => Boolean(weather))
+  );
 }
 
 function getCachedOddsLines(cacheKey) {
@@ -1297,6 +1374,99 @@ export async function fetchPlayersHittingStatsByIds(playerIds, season) {
     })
   );
 
+  return Object.fromEntries(results);
+}
+
+export async function fetchPlayerVsPitcherHittingStats(playerId, pitcherId) {
+  const normalizedPlayerId = Number(playerId);
+  const normalizedPitcherId = Number(pitcherId);
+  if (!normalizedPlayerId || !normalizedPitcherId) {
+    return null;
+  }
+
+  const cacheKey = `${normalizedPlayerId}-${normalizedPitcherId}-career`;
+  const cached = hitterVsPitcherStatsCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const url = new URL(`${PEOPLE_BASE_URL}/${normalizedPlayerId}`);
+  url.searchParams.set(
+    "hydrate",
+    `stats(group=[hitting],type=[vsPlayer],opposingPlayerId=${normalizedPitcherId},sportId=1)`
+  );
+
+  try {
+    const response = await fetch(url.toString());
+    if (!response.ok) {
+      hitterVsPitcherStatsCache.set(cacheKey, null);
+      return null;
+    }
+
+    const payload = await response.json();
+    const splits = payload.people?.[0]?.stats?.[0]?.splits ?? [];
+    if (!splits.length) {
+      hitterVsPitcherStatsCache.set(cacheKey, null);
+      return null;
+    }
+    const aggregate = splits.reduce(
+      (acc, split) => {
+        const stat = split?.stat ?? {};
+        const atBats = asNumber(stat.atBats);
+        const hits = asNumber(stat.hits);
+        const walks = asNumber(stat.baseOnBalls);
+        const hitByPitch = asNumber(stat.hitByPitch);
+        const plateAppearances =
+          asNumber(stat.plateAppearances) || Math.max(atBats + walks + hitByPitch, 0);
+        return {
+          atBats: acc.atBats + atBats,
+          hits: acc.hits + hits,
+          walks: acc.walks + walks,
+          hitByPitch: acc.hitByPitch + hitByPitch,
+          plateAppearances: acc.plateAppearances + plateAppearances
+        };
+      },
+      { atBats: 0, hits: 0, walks: 0, hitByPitch: 0, plateAppearances: 0 }
+    );
+    if (!aggregate.atBats && !aggregate.plateAppearances) {
+      hitterVsPitcherStatsCache.set(cacheKey, null);
+      return null;
+    }
+    const atBats = aggregate.atBats;
+    const hits = aggregate.hits;
+    const walks = aggregate.walks;
+    const hitByPitch = aggregate.hitByPitch;
+    const plateAppearances = aggregate.plateAppearances;
+    const normalized = {
+      pitcherId: normalizedPitcherId,
+      atBats,
+      hits,
+      walks,
+      hitByPitch,
+      plateAppearances,
+      avg: atBats > 0 ? hits / atBats : null,
+      obp: plateAppearances > 0 ? (hits + walks + hitByPitch) / plateAppearances : null
+    };
+    hitterVsPitcherStatsCache.set(cacheKey, normalized);
+    return normalized;
+  } catch (error) {
+    hitterVsPitcherStatsCache.set(cacheKey, null);
+    return null;
+  }
+}
+
+export async function fetchPlayersVsPitcherStatsByIds(playerIds, pitcherId) {
+  const normalizedPitcherId = Number(pitcherId);
+  if (!normalizedPitcherId) {
+    return {};
+  }
+  const uniqueIds = [...new Set((playerIds || []).map((playerId) => Number(playerId)).filter(Boolean))];
+  const results = await Promise.all(
+    uniqueIds.map(async (playerId) => {
+      const stats = await fetchPlayerVsPitcherHittingStats(playerId, normalizedPitcherId);
+      return [playerId, stats];
+    })
+  );
   return Object.fromEntries(results);
 }
 

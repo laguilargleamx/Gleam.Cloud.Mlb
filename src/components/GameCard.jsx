@@ -5,6 +5,7 @@ import {
   fetchTeamStrikeoutsByGame,
   fetchPlayersHittingStatsByIds,
   fetchPlayersHittingStreaksByIds,
+  fetchPlayersVsPitcherStatsByIds,
   getPitcherImageUrl,
   getTeamAbbreviation,
   getTeamLogoUrl
@@ -253,6 +254,32 @@ function getRecommendationBadge(strikeoutValue) {
     label: "Nula",
     probability: safeProbabilityOver
   };
+}
+
+function formatGameWeatherLine(gameWeather) {
+  if (!gameWeather) {
+    return "";
+  }
+  if (gameWeather?.isIndoorLikely) {
+    return "Clima estimado: techo cerrado/interior";
+  }
+  const summary = `${gameWeather?.summary || ""}`.trim();
+  if (summary) {
+    return `Clima estimado: ${summary}`;
+  }
+  const temp = Number(gameWeather?.temperatureC);
+  const wind = Number(gameWeather?.windSpeedKph);
+  if (Number.isFinite(temp) || Number.isFinite(wind)) {
+    const chunks = [];
+    if (Number.isFinite(temp)) {
+      chunks.push(`${temp.toFixed(1)}C`);
+    }
+    if (Number.isFinite(wind)) {
+      chunks.push(`Viento ${wind.toFixed(0)} km/h`);
+    }
+    return `Clima estimado: ${chunks.join(" | ")}`;
+  }
+  return "";
 }
 
 function hasGameStarted(game) {
@@ -596,7 +623,7 @@ function formatProbabilityPercent(probability) {
   return `${Math.round(numeric * 100)}%`;
 }
 
-function estimateHitProbability(stats, streaks, opposingPitcherHandedness) {
+function estimateHitProbability(stats, streaks, opposingPitcherHandedness, vsPitcherStats) {
   const avg = Number(stats?.avg);
   const ops = Number(stats?.ops);
   const hitStreak = Number(streaks?.hitStreak || 0);
@@ -608,10 +635,26 @@ function estimateHitProbability(stats, streaks, opposingPitcherHandedness) {
   const streakAdjustment = clampProbability(hitStreak * 0.008 + singleStreak * 0.006, 0, 0.06);
   const handAdjustment = handText.startsWith("zur") ? 0.005 : 0;
 
-  return clampProbability(baseAvg + opsAdjustment + streakAdjustment + handAdjustment, 0.14, 0.8);
+  const baseProbability = clampProbability(
+    baseAvg + opsAdjustment + streakAdjustment + handAdjustment,
+    0.14,
+    0.8
+  );
+  const atBatsVsPitcher = Number(vsPitcherStats?.atBats || 0);
+  const hitsVsPitcher = Number(vsPitcherStats?.hits || 0);
+  if (atBatsVsPitcher <= 0 || hitsVsPitcher < 0) {
+    return baseProbability;
+  }
+  const rawVsHitRate = clampProbability(hitsVsPitcher / atBatsVsPitcher, 0.05, 0.95);
+  const sampleWeight = clampProbability((atBatsVsPitcher - 2) / 18, 0, 0.3);
+  return clampProbability(
+    baseProbability * (1 - sampleWeight) + rawVsHitRate * sampleWeight,
+    0.14,
+    0.8
+  );
 }
 
-function estimateOnBaseProbability(stats, streaks, hitProbability) {
+function estimateOnBaseProbability(stats, streaks, hitProbability, vsPitcherStats) {
   const obp = Number(stats?.obp);
   const hitStreak = Number(streaks?.hitStreak || 0);
   const xbhStreak = Number(streaks?.xbhStreak || 0);
@@ -619,7 +662,31 @@ function estimateOnBaseProbability(stats, streaks, hitProbability) {
   const baseObp =
     Number.isFinite(obp) && obp > 0 ? obp : clampProbability(Number(hitProbability) + 0.07, 0.22, 0.42);
   const streakAdjustment = clampProbability(hitStreak * 0.006 + xbhStreak * 0.003, 0, 0.05);
-  return clampProbability(baseObp + streakAdjustment, 0.2, 0.9);
+  const baseProbability = clampProbability(baseObp + streakAdjustment, 0.2, 0.9);
+  const plateAppearancesVsPitcher = Number(vsPitcherStats?.plateAppearances || 0);
+  if (plateAppearancesVsPitcher <= 0) {
+    return baseProbability;
+  }
+  const onBaseEvents =
+    Number(vsPitcherStats?.hits || 0) +
+    Number(vsPitcherStats?.walks || 0) +
+    Number(vsPitcherStats?.hitByPitch || 0);
+  const rawVsOnBaseRate = clampProbability(onBaseEvents / plateAppearancesVsPitcher, 0.08, 0.98);
+  const sampleWeight = clampProbability((plateAppearancesVsPitcher - 3) / 20, 0, 0.32);
+  return clampProbability(
+    baseProbability * (1 - sampleWeight) + rawVsOnBaseRate * sampleWeight,
+    0.2,
+    0.9
+  );
+}
+
+function formatVsPitcherLabel(vsPitcherStats) {
+  const hits = Number(vsPitcherStats?.hits || 0);
+  const atBats = Number(vsPitcherStats?.atBats || 0);
+  if (atBats <= 0) {
+    return "-";
+  }
+  return `${hits}/${atBats}`;
 }
 
 function StatsTable({
@@ -627,17 +694,30 @@ function StatsTable({
   players,
   statsByPlayerId,
   streaksByPlayerId,
+  vsPitcherStatsByPlayerId,
   opposingPitcherHandedness
 }) {
   const playersWithProbabilities = players.map((player) => {
     const stats = statsByPlayerId?.[player.playerId];
     const streaks = streaksByPlayerId?.[player.playerId];
-    const hitProbability = estimateHitProbability(stats, streaks, opposingPitcherHandedness);
-    const onBaseProbability = estimateOnBaseProbability(stats, streaks, hitProbability);
+    const vsPitcherStats = vsPitcherStatsByPlayerId?.[player.playerId];
+    const hitProbability = estimateHitProbability(
+      stats,
+      streaks,
+      opposingPitcherHandedness,
+      vsPitcherStats
+    );
+    const onBaseProbability = estimateOnBaseProbability(
+      stats,
+      streaks,
+      hitProbability,
+      vsPitcherStats
+    );
     return {
       ...player,
       stats,
       streaks,
+      vsPitcherStats,
       hitProbability,
       onBaseProbability
     };
@@ -679,6 +759,7 @@ function StatsTable({
                 <th>HST</th>
                 <th>1BST</th>
                 <th>XBHST</th>
+                <th>VS P</th>
                 <th>Hit%</th>
                 <th>Emb%</th>
                 <th>Fire</th>
@@ -699,6 +780,7 @@ function StatsTable({
                     <td>{streaks?.hitStreak ?? "-"}</td>
                     <td>{streaks?.singleStreak ?? "-"}</td>
                     <td>{streaks?.xbhStreak ?? "-"}</td>
+                    <td>{formatVsPitcherLabel(player.vsPitcherStats)}</td>
                     <td>{formatProbabilityPercent(player.hitProbability)}</td>
                     <td>{formatProbabilityPercent(player.onBaseProbability)}</td>
                     <td>{isFireUp ? "🔥" : "-"}</td>
@@ -720,6 +802,7 @@ export default function GameCard({
   pitcherStrikeoutLinesById,
   pitcherStrikeoutValueById,
   pitcherHandednessById,
+  gameWeatherByGamePk,
   oddsLoading,
   onRefreshOddsForGame
 }) {
@@ -730,6 +813,10 @@ export default function GameCard({
   const [lineupOpen, setLineupOpen] = useState(false);
   const [lineupLoading, setLineupLoading] = useState(false);
   const [lineupStatsLoading, setLineupStatsLoading] = useState(false);
+  const [lineupVsPitcherStatsByTeam, setLineupVsPitcherStatsByTeam] = useState({
+    away: {},
+    home: {}
+  });
   const [lineupError, setLineupError] = useState("");
   const [showStatsInfo, setShowStatsInfo] = useState(false);
   const [pitcherModal, setPitcherModal] = useState({
@@ -761,6 +848,7 @@ export default function GameCard({
   const statusLabel = liveInningLabel
     ? `${game.status.detailedState} - ${liveInningLabel}`
     : game.status.detailedState;
+  const weatherLine = formatGameWeatherLine(gameWeatherByGamePk?.[game?.gamePk]);
   const effectiveOddsLoading = oddsLoading || oddsRefreshLoading;
   const activeOpposingPitcherHandedness =
     activeStatsTeam === "away"
@@ -781,7 +869,7 @@ export default function GameCard({
 
     setLineupLoading(true);
     setLineupError("");
-    const fetchedLineups = await fetchGameLineups(game.gamePk);
+    const fetchedLineups = await fetchGameLineups(game.gamePk, game);
     if (!fetchedLineups) {
       setLineupError("No se pudo obtener el lineup de este juego.");
       setLineupLoading(false);
@@ -791,15 +879,25 @@ export default function GameCard({
     const lineupPlayerIds = [...fetchedLineups.away, ...fetchedLineups.home].map(
       (player) => player.playerId
     );
+    const awayLineupPlayerIds = (fetchedLineups.away ?? []).map((player) => player.playerId);
+    const homeLineupPlayerIds = (fetchedLineups.home ?? []).map((player) => player.playerId);
+    const awayOpposingPitcherId = Number(homePitcherId || 0);
+    const homeOpposingPitcherId = Number(awayPitcherId || 0);
     const season = game.season ?? game.officialDate?.split("-")[0];
 
     setLineupStatsLoading(true);
-    const [fetchedStats, fetchedStreaks] = await Promise.all([
+    const [fetchedStats, fetchedStreaks, awayVsPitcherStats, homeVsPitcherStats] = await Promise.all([
       fetchPlayersHittingStatsByIds(lineupPlayerIds, season),
-      fetchPlayersHittingStreaksByIds(lineupPlayerIds, season)
+      fetchPlayersHittingStreaksByIds(lineupPlayerIds, season),
+      fetchPlayersVsPitcherStatsByIds(awayLineupPlayerIds, awayOpposingPitcherId),
+      fetchPlayersVsPitcherStatsByIds(homeLineupPlayerIds, homeOpposingPitcherId)
     ]);
     setLineupStatsByPlayerId(fetchedStats);
     setLineupStreaksByPlayerId(fetchedStreaks);
+    setLineupVsPitcherStatsByTeam({
+      away: awayVsPitcherStats ?? {},
+      home: homeVsPitcherStats ?? {}
+    });
     setLineupStatsLoading(false);
     setLineupLoading(false);
   }
@@ -929,6 +1027,7 @@ export default function GameCard({
       </div>
 
       <p className="venue-line">{game.venue.name}</p>
+      {weatherLine ? <p className="weather-line">{weatherLine}</p> : null}
 
       <div className="pitchers-row">
         <PitcherBlock
@@ -1023,6 +1122,9 @@ export default function GameCard({
                     <strong>XBHST:</strong> Racha actual con extra-base hit (2B/3B/HR).
                   </p>
                   <p>
+                    <strong>VS P:</strong> Historial del bateador vs pitcher rival (Hits/Turnos).
+                  </p>
+                  <p>
                     <strong>Hit%:</strong> Probabilidad estimada de conectar al menos un hit hoy.
                   </p>
                   <p>
@@ -1062,6 +1164,11 @@ export default function GameCard({
                   players={activeStatsTeam === "away" ? lineups.away : lineups.home}
                   statsByPlayerId={lineupStatsByPlayerId}
                   streaksByPlayerId={lineupStreaksByPlayerId}
+                  vsPitcherStatsByPlayerId={
+                    activeStatsTeam === "away"
+                      ? lineupVsPitcherStatsByTeam.away
+                      : lineupVsPitcherStatsByTeam.home
+                  }
                   opposingPitcherHandedness={activeOpposingPitcherHandedness}
                 />
               </div>

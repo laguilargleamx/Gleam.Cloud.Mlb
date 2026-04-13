@@ -721,6 +721,12 @@ body {
   padding-top: 0.7rem;
 }
 
+.weather-line {
+  margin: -0.35rem 0 0;
+  font-size: 0.82rem;
+  color: #475569;
+}
+
 .pitchers-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
