@@ -851,7 +851,9 @@ export async function fetchPitcherGameLogs(playerId, season) {
             opponentId: split?.opponent?.id ?? null,
             opponentName: split?.opponent?.name ?? "Rival no disponible",
             inningsPitched: split?.stat?.inningsPitched ?? "-",
-            strikeOuts: split?.stat?.strikeOuts ?? "-"
+            strikeOuts: split?.stat?.strikeOuts ?? "-",
+            numberOfPitches:
+              split?.stat?.numberOfPitches ?? split?.stat?.pitchesThrown ?? split?.stat?.strikes ?? "-"
           };
         })
       )

@@ -781,8 +781,27 @@ body {
 }
 
 .bullpen-column h4 {
-  margin: 0 0 0.45rem;
+  margin: 0;
   font-size: 0.96rem;
+}
+
+.bullpen-column-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.45rem;
+}
+
+.bullpen-era-badge {
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+  border-radius: 999px;
+  font-size: 0.73rem;
+  font-weight: 700;
+  padding: 0.14rem 0.5rem;
+  white-space: nowrap;
 }
 
 .bullpen-list {
@@ -800,6 +819,48 @@ body {
   background: #ffffff;
   display: grid;
   gap: 0.12rem;
+}
+
+.bullpen-row.top-probable {
+  border-color: #93c5fd;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  box-shadow: inset 3px 0 0 #60a5fa;
+}
+
+.bullpen-row-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.bullpen-prob-chip {
+  border-radius: 999px;
+  border: 1px solid #d1d5db;
+  background: #f9fafb;
+  color: #374151;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.08rem 0.44rem;
+  white-space: nowrap;
+}
+
+.bullpen-prob-chip.high {
+  border-color: #86efac;
+  background: #dcfce7;
+  color: #166534;
+}
+
+.bullpen-prob-chip.mid {
+  border-color: #93c5fd;
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.bullpen-prob-chip.low {
+  border-color: #fde68a;
+  background: #fef3c7;
+  color: #92400e;
 }
 
 .bullpen-row span {

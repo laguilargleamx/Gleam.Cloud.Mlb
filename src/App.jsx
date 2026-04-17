@@ -1375,21 +1375,38 @@ export default function App() {
           game.teams?.home?.probablePitcher?.id
         ]);
         const season = selectedDate.split("-")[0];
-        const [erasMap, strikeoutsPerGameMap, oddsSnapshot, handednessMap, weatherByGamePk] =
-          await Promise.all([
-            fetchPitcherErasByIds(pitcherIds, season),
-            fetchPitcherStrikeoutsPerGameByIds(pitcherIds, season),
-            fetchPitcherStrikeoutLinesByGames(fetchedGames),
-            fetchPitcherHandednessByIds(pitcherIds),
-            fetchGameWeatherByGames(fetchedGames, { forceRefresh })
-          ]);
+        const [
+          erasResult,
+          strikeoutsPerGameResult,
+          oddsResult,
+          handednessResult,
+          weatherResult
+        ] = await Promise.allSettled([
+          fetchPitcherErasByIds(pitcherIds, season),
+          fetchPitcherStrikeoutsPerGameByIds(pitcherIds, season),
+          fetchPitcherStrikeoutLinesByGames(fetchedGames),
+          fetchPitcherHandednessByIds(pitcherIds),
+          fetchGameWeatherByGames(fetchedGames, { forceRefresh })
+        ]);
+        const erasMap = erasResult.status === "fulfilled" ? erasResult.value : {};
+        const strikeoutsPerGameMap =
+          strikeoutsPerGameResult.status === "fulfilled" ? strikeoutsPerGameResult.value : {};
+        const oddsSnapshot =
+          oddsResult.status === "fulfilled"
+            ? oddsResult.value
+            : { linesByPitcherId: {}, totalsByGamePk: {} };
+        const handednessMap = handednessResult.status === "fulfilled" ? handednessResult.value : {};
+        const weatherByGamePk = weatherResult.status === "fulfilled" ? weatherResult.value : {};
         const strikeoutLinesMap = oddsSnapshot?.linesByPitcherId ?? {};
         const totalsByGamePk = oddsSnapshot?.totalsByGamePk ?? {};
-        const strikeoutValueMap = await evaluatePitcherStrikeoutValueByGames(
-          fetchedGames,
-          strikeoutLinesMap,
-          { season, pitcherHandednessById: handednessMap }
-        );
+        const strikeoutValueMap =
+          strikeoutLinesMap && Object.keys(strikeoutLinesMap).length
+            ? await evaluatePitcherStrikeoutValueByGames(
+                fetchedGames,
+                strikeoutLinesMap,
+                { season, pitcherHandednessById: handednessMap }
+              )
+            : {};
 
         if (!ignore) {
           const nextSnapshot = {

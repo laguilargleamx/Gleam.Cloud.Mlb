@@ -284,13 +284,46 @@ function formatGameWeatherLine(gameWeather) {
 }
 
 function formatBullpenPitcherLine(pitcher) {
-  const probability = Number(pitcher?.probability || 0);
   const rest = Number(pitcher?.daysSinceLast || 0);
   const pitches = Number(pitcher?.pitchesLast || 0);
   const status = pitcher?.status || "disponible";
   const era = Number(pitcher?.era);
   const eraLabel = Number.isFinite(era) ? `ERA ${era.toFixed(2)}` : "ERA --";
-  return `${eraLabel} · ${probability}% · Descanso ${rest}d · Ult ${pitches} p · ${status}`;
+  return `${eraLabel} · Descanso ${rest}d · Ult ${pitches} p · ${status}`;
+}
+
+function computeBullpenProbableEra(teamBullpen) {
+  const pitchers = teamBullpen?.pitchers ?? [];
+  if (!pitchers.length) {
+    return null;
+  }
+  let weightedTotal = 0;
+  let weightCount = 0;
+  for (const pitcher of pitchers) {
+    const era = Number(pitcher?.era);
+    const probability = Number(pitcher?.probability || 0);
+    if (!Number.isFinite(era) || era <= 0) {
+      continue;
+    }
+    const weight = Number.isFinite(probability) && probability > 0 ? probability : 8;
+    weightedTotal += era * weight;
+    weightCount += weight;
+  }
+  if (!weightCount) {
+    return null;
+  }
+  return weightedTotal / weightCount;
+}
+
+function getBullpenProbabilityTone(probability) {
+  const numeric = Number(probability || 0);
+  if (numeric >= 80) {
+    return "high";
+  }
+  if (numeric >= 68) {
+    return "mid";
+  }
+  return "low";
 }
 
 function getRunsProjectionTone(lean) {
@@ -829,6 +862,7 @@ function PitcherGameLogModal({
                     <th>Vs</th>
                     <th>IP</th>
                     <th>SO</th>
+                    <th>Picheos</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -850,6 +884,7 @@ function PitcherGameLogModal({
                       </td>
                       <td>{log.inningsPitched}</td>
                       <td>{log.strikeOuts}</td>
+                      <td>{log.numberOfPitches ?? "-"}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1483,23 +1518,44 @@ export default function GameCard({
               {[
                 { key: "away", label: game.teams.away.team.name },
                 { key: "home", label: game.teams.home.team.name }
-              ].map((side) => (
-                <section key={`${game.gamePk}-${side.key}`} className="bullpen-column">
-                  <h4>{side.label}</h4>
-                  {(bullpenProbables?.[side.key]?.pitchers ?? []).length ? (
-                    <ul className="bullpen-list">
-                      {(bullpenProbables?.[side.key]?.pitchers ?? []).map((pitcher) => (
-                        <li key={`${side.key}-${pitcher.pitcherId}`} className="bullpen-row">
-                          <strong>{pitcher.fullName}</strong>
-                          <span>{formatBullpenPitcherLine(pitcher)}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="lineup-empty">Sin suficientes datos de bullpen.</p>
-                  )}
-                </section>
-              ))}
+              ].map((side) => {
+                const sideBullpen = bullpenProbables?.[side.key];
+                const bullpenEra = computeBullpenProbableEra(sideBullpen);
+                return (
+                  <section key={`${game.gamePk}-${side.key}`} className="bullpen-column">
+                    <div className="bullpen-column-header">
+                      <h4>{side.label}</h4>
+                      <span className="bullpen-era-badge">
+                        ERA Bullpen: {Number.isFinite(bullpenEra) ? bullpenEra.toFixed(2) : "--"}
+                      </span>
+                    </div>
+                    {(sideBullpen?.pitchers ?? []).length ? (
+                      <ul className="bullpen-list">
+                        {(sideBullpen?.pitchers ?? []).map((pitcher, index) => (
+                          <li
+                            key={`${side.key}-${pitcher.pitcherId}`}
+                            className={`bullpen-row ${index < 3 ? "top-probable" : ""}`}
+                          >
+                            <div className="bullpen-row-head">
+                              <strong>{pitcher.fullName}</strong>
+                              <span
+                                className={`bullpen-prob-chip ${getBullpenProbabilityTone(
+                                  pitcher.probability
+                                )}`}
+                              >
+                                {Number(pitcher?.probability || 0)}%
+                              </span>
+                            </div>
+                            <span>{formatBullpenPitcherLine(pitcher)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="lineup-empty">Sin suficientes datos de bullpen.</p>
+                    )}
+                  </section>
+                );
+              })}
             </div>
           ) : null}
         </div>
