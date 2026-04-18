@@ -27,10 +27,6 @@ ODDS_API_BASE_URL = (os.getenv("THE_ODDS_API_BASE_URL") or "https://api.the-odds
 ODDS_API_KEY = (os.getenv("THE_ODDS_API_KEY") or "").strip()
 ODDS_CACHE_TTL_MINUTES = int(os.getenv("ODDS_CACHE_TTL_MINUTES") or "10")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("ODDS_HTTP_TIMEOUT_SECONDS") or "12")
-MLB_VENUE_BASE_URL = "https://statsapi.mlb.com/api/v1/venues"
-OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-WEATHER_CACHE_TTL_SECONDS = int(os.getenv("WEATHER_CACHE_TTL_SECONDS") or "1800")
-VENUE_CACHE_TTL_SECONDS = int(os.getenv("VENUE_CACHE_TTL_SECONDS") or "43200")
 APP_AUTH_USERNAME = (os.getenv("APP_AUTH_USERNAME") or "admin").strip()
 APP_AUTH_PASSWORD_HASH = (os.getenv("APP_AUTH_PASSWORD_HASH") or "").strip()
 APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD") or "mlb2026"
@@ -53,13 +49,15 @@ class LoginRequest(BaseModel):
     rememberMe: bool = True
 
 
+class CreateUserRequest(BaseModel):
+    username: str = ""
+    password: str = ""
+    role: str = "viewer"
+    active: bool = True
+
+
 class RecommendationHistoryUpsertRequest(BaseModel):
     entries: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class WeatherByGamesRequest(BaseModel):
-    games: list[dict[str, Any]] = Field(default_factory=list)
-    forceRefresh: bool = False
 
 
 app = FastAPI(title="Gleam MLB Odds Backend", version="0.1.0")
@@ -71,8 +69,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 bearer_scheme = HTTPBearer(auto_error=False)
-weather_by_game_cache: dict[str, dict[str, Any]] = {}
-venue_context_cache: dict[int, dict[str, Any]] = {}
 game_totals_cache: dict[str, dict[str, Any]] = {}
 
 
@@ -147,8 +143,8 @@ def decode_bearer_token(
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired token.") from exc
 
-    username = payload.get("sub")
-    if not username or username != APP_AUTH_USERNAME:
+    username = str(payload.get("sub") or "").strip().lower()
+    if not username:
         raise HTTPException(status_code=401, detail="Invalid token subject.")
     return token, payload
 
@@ -188,18 +184,26 @@ def require_authenticated_user(
 ) -> dict[str, Any]:
     _token, payload = decoded
     token_jti = str(payload.get("jti") or "").strip()
+    username = str(payload.get("sub") or "").strip().lower()
     if not token_jti:
         raise HTTPException(status_code=401, detail="Token missing jti.")
+    if not username:
+        raise HTTPException(status_code=401, detail="Token missing subject.")
 
     try:
         with db_conn() as conn:
             prune_expired_revoked_tokens(conn)
             if is_token_revoked(conn, token_jti):
                 raise HTTPException(status_code=401, detail="Token already revoked.")
+            user = load_user_record(conn, username)
+            if not user or not bool(user.get("is_active")):
+                raise HTTPException(status_code=401, detail="User disabled or not found.")
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unexpected auth backend error: {exc}") from exc
+    payload["sub"] = username
+    payload["role"] = normalize_user_role(user.get("role"))
     return payload
 
 
@@ -324,186 +328,77 @@ def normalize_pick_domain(value: Any) -> str:
     return "strikeouts"
 
 
-def extract_game_date(game: dict[str, Any]) -> str:
-    raw = str(game.get("officialDate") or game.get("gameDate") or "").strip()
-    return raw[:10] if raw else ""
+def normalize_user_role(role: Any) -> str:
+    normalized = str(role or "").strip().lower()
+    if normalized in {"admin", "viewer"}:
+        return normalized
+    return "viewer"
 
 
-def is_probably_indoor(roof_type: Any) -> bool:
-    normalized = str(roof_type or "").strip().lower()
-    if not normalized:
-        return False
-    return "dome" in normalized or "closed" in normalized
-
-
-def parse_float(value: Any) -> float | None:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
+def load_user_record(conn: pymysql.connections.Connection, username: str) -> dict[str, Any] | None:
+    username_normalized = str(username or "").strip().lower()
+    if not username_normalized:
         return None
-    return numeric if numeric == numeric else None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT username, password_hash, role, is_active, created_at, updated_at, last_login_at
+            FROM users
+            WHERE username = %s
+            LIMIT 1
+            """,
+            (username_normalized,),
+        )
+        row = cur.fetchone()
+    return row if row else None
 
 
-def parse_hourly_time_to_utc(value: str) -> datetime | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+def upsert_user_record(
+    conn: pymysql.connections.Connection,
+    *,
+    username: str,
+    password_hash: str,
+    role: str,
+    is_active: bool,
+) -> None:
+    username_normalized = str(username or "").strip().lower()
+    if not username_normalized:
+        raise ValueError("Invalid username.")
+    role_normalized = normalize_user_role(role)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO users (username, password_hash, role, is_active, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+              password_hash = VALUES(password_hash),
+              role = VALUES(role),
+              is_active = VALUES(is_active),
+              updated_at = VALUES(updated_at)
+            """,
+            (
+                username_normalized,
+                password_hash,
+                role_normalized,
+                1 if is_active else 0,
+                utc_now().replace(tzinfo=None),
+                utc_now().replace(tzinfo=None),
+            ),
+        )
 
 
-def build_weather_summary(node: dict[str, Any]) -> str:
-    temp_c = parse_float(node.get("temperatureC"))
-    wind_kph = parse_float(node.get("windSpeedKph"))
-    precip = parse_float(node.get("precipitationProbability"))
-    chunks: list[str] = []
-    if temp_c is not None:
-        chunks.append(f"{temp_c:.1f}C")
-    if wind_kph is not None:
-        chunks.append(f"Viento {wind_kph:.0f} km/h")
-    if precip is not None:
-        chunks.append(f"Lluvia {precip:.0f}%")
-    return " | ".join(chunks)
-
-
-async def fetch_venue_context(venue_id: int) -> dict[str, Any] | None:
-    if not venue_id:
-        return None
-    cached = venue_context_cache.get(venue_id)
-    now = utc_now()
-    if cached and isinstance(cached.get("expiresAt"), datetime) and cached["expiresAt"] > now:
-        return cached.get("value")
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.get(f"{MLB_VENUE_BASE_URL}/{venue_id}")
-        if response.status_code >= 400:
-            return None
-        payload = response.json()
-    venue_node = (payload.get("venues") or [None])[0] or {}
-    location = venue_node.get("location") or {}
-    coords = location.get("defaultCoordinates") or {}
-    context = {
-        "venueId": venue_id,
-        "venueName": venue_node.get("name") or "",
-        "roofType": venue_node.get("roofType") or "",
-        "latitude": parse_float(coords.get("latitude")),
-        "longitude": parse_float(coords.get("longitude")),
-    }
-    venue_context_cache[venue_id] = {
-        "expiresAt": now + timedelta(seconds=max(300, VENUE_CACHE_TTL_SECONDS)),
-        "value": context,
-    }
-    return context
-
-
-async def fetch_open_meteo_weather(latitude: float, longitude: float, game_time_iso: str) -> dict[str, Any] | None:
-    if latitude is None or longitude is None or not game_time_iso:
-        return None
-    try:
-        game_dt = datetime.fromisoformat(str(game_time_iso).replace("Z", "+00:00")).astimezone(timezone.utc)
-    except ValueError:
-        return None
-
-    start_date = game_dt.date().isoformat()
-    end_date = start_date
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "hourly": "temperature_2m,apparent_temperature,precipitation_probability,wind_speed_10m,wind_direction_10m,weather_code",
-        "timezone": "UTC",
-        "start_date": start_date,
-        "end_date": end_date,
-        "wind_speed_unit": "kmh",
-    }
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.get(OPEN_METEO_FORECAST_URL, params=params)
-        if response.status_code >= 400:
-            return None
-        payload = response.json()
-
-    hourly = payload.get("hourly") or {}
-    times = hourly.get("time") or []
-    if not times:
-        return None
-    nearest_index = -1
-    nearest_diff = None
-    for index, raw_time in enumerate(times):
-        parsed_time = parse_hourly_time_to_utc(raw_time)
-        if parsed_time is None:
-            continue
-        diff = abs((parsed_time - game_dt).total_seconds())
-        if nearest_diff is None or diff < nearest_diff:
-            nearest_diff = diff
-            nearest_index = index
-    if nearest_index < 0:
-        return None
-
-    def read_hourly(metric: str) -> Any:
-        values = hourly.get(metric) or []
-        if nearest_index >= len(values):
-            return None
-        return values[nearest_index]
-
-    return {
-        "temperatureC": parse_float(read_hourly("temperature_2m")),
-        "apparentTemperatureC": parse_float(read_hourly("apparent_temperature")),
-        "precipitationProbability": parse_float(read_hourly("precipitation_probability")),
-        "windSpeedKph": parse_float(read_hourly("wind_speed_10m")),
-        "windDirectionDeg": parse_float(read_hourly("wind_direction_10m")),
-        "weatherCode": read_hourly("weather_code"),
-        "sampledAtUtc": times[nearest_index],
-    }
-
-
-async def resolve_game_weather(game: dict[str, Any], force_refresh: bool) -> dict[str, Any] | None:
-    game_pk = int(game.get("gamePk") or 0)
-    if not game_pk:
-        return None
-    cache_key = str(game_pk)
-    now = utc_now()
-    cached = weather_by_game_cache.get(cache_key)
-    if (
-        not force_refresh
-        and cached
-        and isinstance(cached.get("expiresAt"), datetime)
-        and cached["expiresAt"] > now
-    ):
-        return cached.get("value")
-
-    venue_id = int(((game.get("venue") or {}).get("id")) or 0)
-    venue = await fetch_venue_context(venue_id)
-    lat = parse_float((venue or {}).get("latitude"))
-    lon = parse_float((venue or {}).get("longitude"))
-    roof_type = str((venue or {}).get("roofType") or "").strip()
-    game_time_iso = str(game.get("gameDate") or "").strip()
-    weather = await fetch_open_meteo_weather(lat, lon, game_time_iso)
-    if not weather:
-        return None
-
-    result = {
-        "temperatureC": weather.get("temperatureC"),
-        "apparentTemperatureC": weather.get("apparentTemperatureC"),
-        "precipitationProbability": weather.get("precipitationProbability"),
-        "windSpeedKph": weather.get("windSpeedKph"),
-        "windDirectionDeg": weather.get("windDirectionDeg"),
-        "weatherCode": weather.get("weatherCode"),
-        "sampledAtUtc": weather.get("sampledAtUtc"),
-        "roofType": roof_type,
-        "isIndoorLikely": is_probably_indoor(roof_type),
-        "summary": build_weather_summary(weather),
-        "source": "open-meteo",
-        "updatedAt": to_unix_ms(now),
-    }
-    weather_by_game_cache[cache_key] = {
-        "expiresAt": now + timedelta(seconds=max(120, WEATHER_CACHE_TTL_SECONDS)),
-        "value": result,
-    }
-    return result
+def ensure_default_admin_user(conn: pymysql.connections.Connection) -> None:
+    admin_username = str(APP_AUTH_USERNAME or "admin").strip().lower() or "admin"
+    existing = load_user_record(conn, admin_username)
+    if existing:
+        return
+    upsert_user_record(
+        conn,
+        username=admin_username,
+        password_hash=RESOLVED_AUTH_PASSWORD_HASH,
+        role="admin",
+        is_active=True,
+    )
 
 
 async def fetch_odds_json(path: str, params: dict[str, Any]) -> Any:
@@ -525,6 +420,7 @@ def log_odds_api_call(
     conn: pymysql.connections.Connection,
     *,
     token_fingerprint: str,
+    requested_by: str,
     endpoint: str,
     status_code: int | None,
     requests_remaining: int | None,
@@ -537,12 +433,13 @@ def log_odds_api_call(
         cur.execute(
             """
             INSERT INTO odds_api_call_log (
-              token_fingerprint, endpoint, status_code, requests_remaining, requests_used, requests_last, error_message, created_at
+              token_fingerprint, requested_by, endpoint, status_code, requests_remaining, requests_used, requests_last, error_message, created_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 token_fingerprint[:80],
+                (requested_by or "")[:64],
                 endpoint[:120],
                 status_code,
                 requests_remaining,
@@ -661,6 +558,7 @@ def parse_odds_header_int(headers: Any, key: str) -> int | None:
 async def fetch_odds_json_with_usage_log(
     conn: pymysql.connections.Connection,
     *,
+    requested_by: str,
     path: str,
     params: dict[str, Any],
 ) -> Any:
@@ -680,6 +578,7 @@ async def fetch_odds_json_with_usage_log(
             log_odds_api_call(
                 conn,
                 token_fingerprint=token_fingerprint,
+                requested_by=requested_by,
                 endpoint=endpoint,
                 status_code=response.status_code,
                 requests_remaining=requests_remaining,
@@ -695,6 +594,7 @@ async def fetch_odds_json_with_usage_log(
         log_odds_api_call(
             conn,
             token_fingerprint=token_fingerprint,
+            requested_by=requested_by,
             endpoint=endpoint,
             status_code=response.status_code,
             requests_remaining=requests_remaining,
@@ -708,6 +608,7 @@ async def fetch_odds_json_with_usage_log(
         log_odds_api_call(
             conn,
             token_fingerprint=token_fingerprint,
+            requested_by=requested_by,
             endpoint=endpoint,
             status_code=None,
             requests_remaining=None,
@@ -760,6 +661,19 @@ def load_odds_usage_summary(conn: pymysql.connections.Connection) -> dict[str, A
             """
         )
         latest_row = cur.fetchone() or {}
+        cur.execute(
+            """
+            SELECT
+              COALESCE(NULLIF(requested_by, ''), '(sin usuario)') AS requested_by,
+              COUNT(*) AS total_calls,
+              MAX(created_at) AS last_call_at
+            FROM odds_api_call_log
+            GROUP BY COALESCE(NULLIF(requested_by, ''), '(sin usuario)')
+            ORDER BY total_calls DESC, requested_by ASC
+            LIMIT 12
+            """
+        )
+        callers_rows = cur.fetchall() or []
 
     token_history = [
         {
@@ -781,6 +695,14 @@ def load_odds_usage_summary(conn: pymysql.connections.Connection) -> dict[str, A
         }
         for row in token_history_rows
     ]
+    calls_by_user = [
+        {
+            "username": str(row.get("requested_by") or "(sin usuario)"),
+            "totalCalls": int(row.get("total_calls") or 0),
+            "lastCallAt": to_unix_ms(row.get("last_call_at")),
+        }
+        for row in callers_rows
+    ]
 
     return {
         "currentTokenFingerprint": token_fingerprint,
@@ -797,6 +719,7 @@ def load_odds_usage_summary(conn: pymysql.connections.Connection) -> dict[str, A
         "todayFailedCalls": int(current_row.get("failed_calls") or 0),
         "allTimeCalls": int(all_time_row.get("total_calls_all_time") or 0),
         "tokenHistory": token_history,
+        "callsByUser": calls_by_user,
         "requestsRemaining": (
             int(current_row.get("last_requests_remaining"))
             if current_row.get("last_requests_remaining") is not None
@@ -992,10 +915,25 @@ def create_tables_if_needed() -> None:
       KEY idx_username_status (username, status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """
+    users_sql = """
+    CREATE TABLE IF NOT EXISTS users (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      username VARCHAR(64) NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      role VARCHAR(24) NOT NULL DEFAULT 'viewer',
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      last_login_at DATETIME NULL,
+      created_at DATETIME NOT NULL,
+      updated_at DATETIME NOT NULL,
+      UNIQUE KEY uq_users_username (username),
+      KEY idx_users_role_active (role, is_active)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
     odds_call_log_sql = """
     CREATE TABLE IF NOT EXISTS odds_api_call_log (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       token_fingerprint VARCHAR(80) NOT NULL DEFAULT '',
+      requested_by VARCHAR(64) NOT NULL DEFAULT '',
       endpoint VARCHAR(120) NOT NULL,
       status_code INT NULL,
       requests_remaining INT NULL,
@@ -1035,6 +973,7 @@ def create_tables_if_needed() -> None:
             cur.execute(odds_sql)
             cur.execute(revoked_tokens_sql)
             cur.execute(recommendation_history_sql)
+            cur.execute(users_sql)
             cur.execute(odds_call_log_sql)
             cur.execute(odds_token_usage_sql)
             cur.execute("SHOW COLUMNS FROM odds_api_call_log LIKE %s", ("token_fingerprint",))
@@ -1048,6 +987,24 @@ def create_tables_if_needed() -> None:
                 cur.execute(
                     "ALTER TABLE odds_api_call_log ADD KEY idx_token_fingerprint (token_fingerprint)"
                 )
+            cur.execute("SHOW COLUMNS FROM odds_api_call_log LIKE %s", ("requested_by",))
+            if not cur.fetchone():
+                cur.execute(
+                    """
+                    ALTER TABLE odds_api_call_log
+                    ADD COLUMN requested_by VARCHAR(64) NOT NULL DEFAULT ''
+                    """
+                )
+            cur.execute("SHOW COLUMNS FROM users LIKE %s", ("role",))
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE users ADD COLUMN role VARCHAR(24) NOT NULL DEFAULT 'viewer'")
+            cur.execute("SHOW COLUMNS FROM users LIKE %s", ("is_active",))
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE users ADD COLUMN is_active TINYINT(1) NOT NULL DEFAULT 1")
+            cur.execute("SHOW COLUMNS FROM users LIKE %s", ("last_login_at",))
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE users ADD COLUMN last_login_at DATETIME NULL")
+            ensure_default_admin_user(conn)
             cur.execute("SHOW COLUMNS FROM recommendation_history LIKE %s", ("pick_domain",))
             if not cur.fetchone():
                 cur.execute(
@@ -1296,6 +1253,7 @@ def upsert_recommendation_history_entry(
 
 async def resolve_lines_for_game(
     conn: pymysql.connections.Connection,
+    requested_by: str,
     game: dict[str, Any],
     preferred_bookmaker_key: str,
     regions: str,
@@ -1325,6 +1283,7 @@ async def resolve_lines_for_game(
     if events_cache is None:
         raw_events = await fetch_odds_json_with_usage_log(
             conn,
+            requested_by=requested_by,
             path="/sports/baseball_mlb/events",
             params={},
         )
@@ -1336,6 +1295,7 @@ async def resolve_lines_for_game(
 
     odds_payload = await fetch_odds_json_with_usage_log(
         conn,
+        requested_by=requested_by,
         path=f"/sports/baseball_mlb/events/{event['id']}/odds",
         params={
             "regions": regions,
@@ -1418,19 +1378,36 @@ def health() -> dict[str, str]:
 
 @app.post("/auth/login")
 def auth_login(req: LoginRequest) -> dict[str, Any]:
-    input_username = req.username.strip()
-    if input_username != APP_AUTH_USERNAME:
+    input_username = req.username.strip().lower()
+    if not input_username:
         raise HTTPException(status_code=401, detail="Invalid credentials.")
+    try:
+        with db_conn() as conn:
+            user = load_user_record(conn, input_username)
+            if not user or not bool(user.get("is_active")):
+                raise HTTPException(status_code=401, detail="Invalid credentials.")
+            if not verify_password(req.password, str(user.get("password_hash") or "")):
+                raise HTTPException(status_code=401, detail="Invalid credentials.")
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET last_login_at = %s, updated_at = %s WHERE username = %s",
+                    (
+                        utc_now().replace(tzinfo=None),
+                        utc_now().replace(tzinfo=None),
+                        input_username,
+                    ),
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected auth backend error: {exc}") from exc
 
-    if not verify_password(req.password, RESOLVED_AUTH_PASSWORD_HASH):
-        raise HTTPException(status_code=401, detail="Invalid credentials.")
-
-    access_token, expires_at = issue_access_token(APP_AUTH_USERNAME, bool(req.rememberMe))
+    access_token, expires_at = issue_access_token(input_username, bool(req.rememberMe))
     return {
         "accessToken": access_token,
         "tokenType": "Bearer",
         "expiresAt": to_unix_ms(expires_at),
-        "username": APP_AUTH_USERNAME
+        "username": input_username
     }
 
 
@@ -1441,8 +1418,40 @@ def auth_me(auth_payload: dict[str, Any] = Depends(require_authenticated_user)) 
     return {
         "authenticated": True,
         "username": str(auth_payload.get("sub") or ""),
+        "role": normalize_user_role(auth_payload.get("role")),
         "expiresAt": expires_at_ms,
     }
+
+
+@app.post("/auth/users")
+def auth_create_user(
+    req: CreateUserRequest,
+    auth_payload: dict[str, Any] = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    requester_role = normalize_user_role(auth_payload.get("role"))
+    if requester_role != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can create users.")
+
+    username = str(req.username or "").strip().lower()
+    password = str(req.password or "")
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must have at least 3 characters.")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must have at least 6 characters.")
+    role = normalize_user_role(req.role)
+    password_hash = hash_password_pbkdf2(password)
+    try:
+        with db_conn() as conn:
+            upsert_user_record(
+                conn,
+                username=username,
+                password_hash=password_hash,
+                role=role,
+                is_active=bool(req.active),
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected auth backend error: {exc}") from exc
+    return {"ok": True, "username": username, "role": role, "active": bool(req.active)}
 
 
 @app.post("/auth/logout")
@@ -1518,35 +1527,6 @@ def recommendations_history_prune_samples(
     return {"ok": True, "deleted": deleted}
 
 
-@app.post("/weather/by-games")
-async def weather_by_games(
-    req: WeatherByGamesRequest,
-    _auth_payload: dict[str, Any] = Depends(require_authenticated_user),
-) -> dict[str, Any]:
-    if not req.games:
-        return {"weatherByGamePk": {}}
-
-    weather_payload: dict[str, dict[str, Any]] = {}
-    try:
-        for game in req.games:
-            if not isinstance(game, dict):
-                continue
-            try:
-                game_pk = int(game.get("gamePk") or 0)
-                if not game_pk:
-                    continue
-                weather = await resolve_game_weather(game, req.forceRefresh)
-                if weather:
-                    weather_payload[str(game_pk)] = weather
-            except Exception:
-                continue
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unexpected weather backend error: {exc}") from exc
-    return {"weatherByGamePk": weather_payload}
-
-
 @app.get("/odds/usage/summary")
 def odds_usage_summary(
     _auth_payload: dict[str, Any] = Depends(require_authenticated_user),
@@ -1562,7 +1542,7 @@ def odds_usage_summary(
 @app.post("/odds/lines/by-games")
 async def odds_lines_by_games(
     req: OddsByGamesRequest,
-    _auth_payload: dict[str, Any] = Depends(require_authenticated_user),
+    auth_payload: dict[str, Any] = Depends(require_authenticated_user),
 ) -> dict[str, Any]:
     if not req.games:
         try:
@@ -1575,6 +1555,7 @@ async def odds_lines_by_games(
     lines_by_pitcher_id: dict[str, dict[str, Any]] = {}
     totals_by_game_pk: dict[str, dict[str, Any]] = {}
     events_cache: list[dict[str, Any]] | None = None
+    requested_by = str(auth_payload.get("sub") or APP_AUTH_USERNAME)
 
     try:
         with db_conn() as conn:
@@ -1584,6 +1565,7 @@ async def odds_lines_by_games(
                 try:
                     game_lines, totals_node, events_cache = await resolve_lines_for_game(
                         conn,
+                        requested_by=requested_by,
                         game=game,
                         preferred_bookmaker_key=req.preferredBookmakerKey,
                         regions=req.regions,

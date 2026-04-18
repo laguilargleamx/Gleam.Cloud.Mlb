@@ -7,7 +7,6 @@ export default function GamesList({
   pitcherStrikeoutLinesById,
   pitcherStrikeoutValueById,
   pitcherHandednessById,
-  gameWeatherByGamePk,
   gameTotalsByGamePk,
   oddsLoading,
   onRefreshOddsForGame,
@@ -28,7 +27,6 @@ export default function GamesList({
           pitcherStrikeoutLinesById={pitcherStrikeoutLinesById}
           pitcherStrikeoutValueById={pitcherStrikeoutValueById}
           pitcherHandednessById={pitcherHandednessById}
-          gameWeatherByGamePk={gameWeatherByGamePk}
           gameTotalsByGamePk={gameTotalsByGamePk}
           oddsLoading={oddsLoading}
           onRefreshOddsForGame={onRefreshOddsForGame}

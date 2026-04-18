@@ -257,32 +257,6 @@ function getRecommendationBadge(strikeoutValue) {
   };
 }
 
-function formatGameWeatherLine(gameWeather) {
-  if (!gameWeather) {
-    return "";
-  }
-  if (gameWeather?.isIndoorLikely) {
-    return "Clima estimado: techo cerrado/interior";
-  }
-  const summary = `${gameWeather?.summary || ""}`.trim();
-  if (summary) {
-    return `Clima estimado: ${summary}`;
-  }
-  const temp = Number(gameWeather?.temperatureC);
-  const wind = Number(gameWeather?.windSpeedKph);
-  if (Number.isFinite(temp) || Number.isFinite(wind)) {
-    const chunks = [];
-    if (Number.isFinite(temp)) {
-      chunks.push(`${temp.toFixed(1)}C`);
-    }
-    if (Number.isFinite(wind)) {
-      chunks.push(`Viento ${wind.toFixed(0)} km/h`);
-    }
-    return `Clima estimado: ${chunks.join(" | ")}`;
-  }
-  return "";
-}
-
 function formatBullpenPitcherLine(pitcher) {
   const rest = Number(pitcher?.daysSinceLast || 0);
   const pitches = Number(pitcher?.pitchesLast || 0);
@@ -399,7 +373,6 @@ function buildRunProjectionModel({
   homeStarterEra,
   awayBullpen,
   homeBullpen,
-  weather,
   sportsbookTotalLine
 }) {
   if (!lineups?.away?.length || !lineups?.home?.length) {
@@ -416,32 +389,14 @@ function buildRunProjectionModel({
   const awayBullpenFactor = clampProbability(1 + (awayBullpenEra - 3.95) * 0.055, 0.84, 1.2);
   const homeBullpenFactor = clampProbability(1 + (homeBullpenEra - 3.95) * 0.055, 0.84, 1.2);
 
-  const weatherTemp = Number(weather?.temperatureC);
-  const weatherWind = Number(weather?.windSpeedKph);
-  const weatherRain = Number(weather?.precipitationProbability);
-  const weatherIsIndoor = Boolean(weather?.isIndoorLikely);
-  let weatherFactor = 1;
-  if (!weatherIsIndoor) {
-    if (Number.isFinite(weatherTemp)) {
-      weatherFactor += clampProbability((weatherTemp - 20) * 0.0035, -0.04, 0.05);
-    }
-    if (Number.isFinite(weatherWind)) {
-      weatherFactor += clampProbability((weatherWind - 14) * 0.0025, -0.015, 0.035);
-    }
-    if (Number.isFinite(weatherRain) && weatherRain >= 55) {
-      weatherFactor -= 0.02;
-    }
-  }
-  weatherFactor = clampProbability(weatherFactor, 0.9, 1.12);
-
   const baseRunsPerTeam = 4.25;
   const awayRuns = clampProbability(
-    baseRunsPerTeam * awayOffense.offenseFactor * awayStarterFactor * awayBullpenFactor * weatherFactor,
+    baseRunsPerTeam * awayOffense.offenseFactor * awayStarterFactor * awayBullpenFactor,
     1.6,
     8.4
   );
   const homeRuns = clampProbability(
-    baseRunsPerTeam * homeOffense.offenseFactor * homeStarterFactor * homeBullpenFactor * weatherFactor,
+    baseRunsPerTeam * homeOffense.offenseFactor * homeStarterFactor * homeBullpenFactor,
     1.6,
     8.4
   );
@@ -469,13 +424,6 @@ function buildRunProjectionModel({
       : homeOffense.offenseFactor <= 0.95
         ? "baja"
         : "normal";
-  const weatherImpactLabel = weatherIsIndoor
-    ? "bajo"
-    : weatherFactor >= 1.04
-      ? "favorece mas carreras"
-      : weatherFactor <= 0.97
-        ? "puede bajar un poco las carreras"
-        : "neutral";
   const leanLabel = !hasSportsbookLine
     ? "Sin linea del sportsbook para comparar"
     : lean === "Over"
@@ -493,12 +441,7 @@ function buildRunProjectionModel({
       : "No hay linea de sportsbook disponible para total de carreras en este juego.",
     `La visita llega con ataque ${awayAttackLevel}, y el local con ataque ${homeAttackLevel}.`,
     `Los abridores proyectan ${normalizeEraValue(homeStarterEra).toFixed(2)} y ${normalizeEraValue(awayStarterEra).toFixed(2)} de ERA.`,
-    `El bullpen probable pinta en ${awayBullpenEra.toFixed(2)} y ${homeBullpenEra.toFixed(2)} de ERA para cerrar el juego.`,
-    weather?.summary
-      ? `Clima ${weatherImpactLabel}: ${weather.summary}${weatherIsIndoor ? " (techo reduce impacto)." : "."}`
-      : weatherIsIndoor
-        ? "Parque con techo: el clima tiene poco impacto."
-        : "No hay señal fuerte de clima extremo."
+    `El bullpen probable pinta en ${awayBullpenEra.toFixed(2)} y ${homeBullpenEra.toFixed(2)} de ERA para cerrar el juego.`
   ];
 
   return {
@@ -1129,7 +1072,6 @@ export default function GameCard({
   pitcherStrikeoutLinesById,
   pitcherStrikeoutValueById,
   pitcherHandednessById,
-  gameWeatherByGamePk,
   gameTotalsByGamePk,
   oddsLoading,
   onRefreshOddsForGame,
@@ -1172,6 +1114,7 @@ export default function GameCard({
     error: ""
   });
   const [oddsRefreshLoading, setOddsRefreshLoading] = useState(false);
+  const [oddsRefreshError, setOddsRefreshError] = useState("");
 
   const localTime = new Date(game.gameDate).toLocaleTimeString([], {
     hour: "numeric",
@@ -1191,7 +1134,6 @@ export default function GameCard({
     : statusText.includes("final")
       ? "final"
       : "scheduled";
-  const weatherLine = formatGameWeatherLine(gameWeatherByGamePk?.[game?.gamePk]);
   const effectiveOddsLoading = oddsLoading || oddsRefreshLoading;
   const activeOpposingPitcherHandedness =
     activeStatsTeam === "away"
@@ -1343,9 +1285,23 @@ export default function GameCard({
     if (!onRefreshOddsForGame) {
       return;
     }
+    if (gameStarted) {
+      setOddsRefreshError("No se pueden refrescar odds: el juego ya inicio.");
+      return;
+    }
+    setOddsRefreshError("");
     setOddsRefreshLoading(true);
-    await onRefreshOddsForGame(game);
-    setOddsRefreshLoading(false);
+    try {
+      const refreshResult = await onRefreshOddsForGame(game);
+      const reason = `${refreshResult?.error || refreshResult?.debug?.error || ""}`.trim();
+      if (reason) {
+        setOddsRefreshError(reason === "Juego iniciado"
+          ? "No se pueden refrescar odds: el juego ya inicio."
+          : reason);
+      }
+    } finally {
+      setOddsRefreshLoading(false);
+    }
   }
 
   async function handleToggleBullpen() {
@@ -1410,7 +1366,6 @@ export default function GameCard({
       homeStarterEra: homeStarterEraValue,
       awayBullpen: bullpenPayload?.away,
       homeBullpen: bullpenPayload?.home,
-      weather: gameWeatherByGamePk?.[game?.gamePk],
       sportsbookTotalLine: gameTotalsByGamePk?.[game?.gamePk]?.line
     });
     if (!model) {
@@ -1463,7 +1418,6 @@ export default function GameCard({
       </div>
 
       <p className="venue-line">{game.venue.name}</p>
-      {weatherLine ? <p className="weather-line">{weatherLine}</p> : null}
 
       <div className="pitchers-row">
         <PitcherBlock
@@ -1497,9 +1451,13 @@ export default function GameCard({
           type="button"
           className="lineup-toggle odds-refresh-button"
           onClick={handleRefreshOddsClick}
-          disabled={oddsRefreshLoading}
+          disabled={oddsRefreshLoading || gameStarted}
         >
-          {oddsRefreshLoading ? "Refrescando odds..." : "Refrescar odds (este juego)"}
+          {oddsRefreshLoading
+            ? "Refrescando odds..."
+            : gameStarted
+              ? "Odds cerradas (juego iniciado)"
+              : "Refrescar odds (este juego)"}
         </button>
         <button
           type="button"
@@ -1540,6 +1498,7 @@ export default function GameCard({
               : "Ver lineups"}
         </button>
       </div>
+      {oddsRefreshError ? <p className="error">{oddsRefreshError}</p> : null}
 
       {bullpenOpen ? (
         <div className="bullpen-panel">

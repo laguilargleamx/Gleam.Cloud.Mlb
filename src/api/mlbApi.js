@@ -18,7 +18,6 @@ const gameBoxscoreCache = new Map();
 const teamStrikeoutsByGameCache = new Map();
 const pitcherHandednessCache = new Map();
 const lineupCache = new Map();
-const gameWeatherCache = new Map();
 const playerHittingStatsCache = new Map();
 const playerHittingStreakCache = new Map();
 const playerHittingGameLogsCache = new Map();
@@ -370,81 +369,6 @@ async function fetchBackendOddsJson(pathname, payload) {
     throw new Error(detail);
   }
   return response.json();
-}
-
-function normalizeBackendWeatherByGame(weatherByGamePk) {
-  if (!weatherByGamePk || typeof weatherByGamePk !== "object") {
-    return {};
-  }
-  return Object.entries(weatherByGamePk).reduce((acc, [gamePk, node]) => {
-    const normalizedGamePk = Number(gamePk);
-    if (!normalizedGamePk || !node || typeof node !== "object") {
-      return acc;
-    }
-    acc[normalizedGamePk] = {
-      temperatureC:
-        typeof node?.temperatureC === "number" ? node.temperatureC : Number(node?.temperatureC),
-      apparentTemperatureC:
-        typeof node?.apparentTemperatureC === "number"
-          ? node.apparentTemperatureC
-          : Number(node?.apparentTemperatureC),
-      precipitationProbability:
-        typeof node?.precipitationProbability === "number"
-          ? node.precipitationProbability
-          : Number(node?.precipitationProbability),
-      windSpeedKph:
-        typeof node?.windSpeedKph === "number" ? node.windSpeedKph : Number(node?.windSpeedKph),
-      windDirectionDeg:
-        typeof node?.windDirectionDeg === "number"
-          ? node.windDirectionDeg
-          : Number(node?.windDirectionDeg),
-      weatherCode: node?.weatherCode ?? null,
-      sampledAtUtc: node?.sampledAtUtc ?? "",
-      roofType: node?.roofType ?? "",
-      isIndoorLikely: Boolean(node?.isIndoorLikely),
-      summary: node?.summary ?? "",
-      source: node?.source ?? "open-meteo",
-      updatedAt: node?.updatedAt ?? Date.now()
-    };
-    return acc;
-  }, {});
-}
-
-export async function fetchGameWeatherByGames(games, { forceRefresh = false } = {}) {
-  if (!Array.isArray(games) || !games.length) {
-    return {};
-  }
-  const uniqueGameIds = [...new Set(games.map((game) => Number(game?.gamePk || 0)).filter(Boolean))];
-  const gamesForRequest = games.filter((game) => uniqueGameIds.includes(Number(game?.gamePk || 0)));
-  if (!gamesForRequest.length) {
-    return {};
-  }
-
-  if (!forceRefresh) {
-    const uncachedGames = gamesForRequest.filter((game) => !gameWeatherCache.has(Number(game?.gamePk || 0)));
-    if (!uncachedGames.length) {
-      return Object.fromEntries(
-        uniqueGameIds
-          .map((gamePk) => [gamePk, gameWeatherCache.get(gamePk)])
-          .filter(([, weather]) => Boolean(weather))
-      );
-    }
-  }
-
-  const payload = await fetchBackendOddsJson("/weather/by-games", {
-    games: gamesForRequest,
-    forceRefresh: Boolean(forceRefresh)
-  });
-  const normalized = normalizeBackendWeatherByGame(payload?.weatherByGamePk);
-  Object.entries(normalized).forEach(([gamePk, node]) => {
-    gameWeatherCache.set(Number(gamePk), node);
-  });
-
-  return Object.fromEntries(
-    uniqueGameIds
-      .map((gamePk) => [gamePk, gameWeatherCache.get(gamePk)])
-      .filter(([, weather]) => Boolean(weather))
-  );
 }
 
 function getCachedOddsLines(cacheKey) {

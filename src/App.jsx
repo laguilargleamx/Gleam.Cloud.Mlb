@@ -7,7 +7,6 @@ import {
   fetchPitcherStrikeoutLinesForGame,
   fetchPitcherStrikeoutLinesByGames,
   fetchPitcherHandednessByIds,
-  fetchGameWeatherByGames,
   fetchGameScoreSummary,
   fetchMlbScheduleByDate,
   fetchPlayersHittingStatsByIds,
@@ -21,6 +20,7 @@ import {
   fetchOddsApiUsageSummary,
   fetchRecommendationHistoryFromBackend,
   loginToBackend,
+  logoutFromBackend,
   pruneSampleRecommendationHistoryFromBackend,
   upsertRecommendationHistoryToBackend,
   setBackendAccessToken
@@ -540,6 +540,23 @@ function formatOddsUsageTooltip(usage) {
   return `Historial tokens: ${rows.join(" | ")}`;
 }
 
+function formatUnixDateTimeLabel(unixMs) {
+  const numeric = Number(unixMs);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return "-";
+  }
+  const date = new Date(numeric);
+  if (Number.isNaN(date.getTime())) {
+    return "-";
+  }
+  return date.toLocaleString("es-ES", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function summarizeResolvedEntries(entries) {
   const wins = (entries ?? []).filter((entry) => entry?.status === "success").length;
   const losses = (entries ?? []).filter((entry) => entry?.status === "failed").length;
@@ -902,12 +919,28 @@ const GAME_LOAD_STEPS_TEMPLATE = [
   { id: "strikeouts", label: "SO por juego", status: "pending", detail: "" },
   { id: "odds", label: "Odds y lineas", status: "pending", detail: "" },
   { id: "handedness", label: "Mano pitcher", status: "pending", detail: "" },
-  { id: "weather", label: "Clima", status: "pending", detail: "" },
   { id: "evaluation", label: "Evaluacion modelo K", status: "pending", detail: "" }
 ];
 
 function createGameLoadSteps() {
   return GAME_LOAD_STEPS_TEMPLATE.map((step) => ({ ...step }));
+}
+
+function withTimeout(promise, timeoutMs, timeoutMessage) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(timeoutMessage || "Timeout"));
+    }, Math.max(1000, Number(timeoutMs) || 1000));
+    Promise.resolve(promise)
+      .then((value) => {
+        clearTimeout(timeoutId);
+        resolve(value);
+      })
+      .catch((error) => {
+        clearTimeout(timeoutId);
+        reject(error);
+      });
+  });
 }
 
 export default function App() {
@@ -921,7 +954,6 @@ export default function App() {
   const [pitcherStrikeoutLinesById, setPitcherStrikeoutLinesById] = useState({});
   const [pitcherStrikeoutValueById, setPitcherStrikeoutValueById] = useState({});
   const [pitcherHandednessById, setPitcherHandednessById] = useState({});
-  const [gameWeatherByGamePk, setGameWeatherByGamePk] = useState({});
   const [gameTotalsByGamePk, setGameTotalsByGamePk] = useState({});
   const [oddsLoading, setOddsLoading] = useState(false);
   const [gamesViewMode, setGamesViewMode] = useState("all");
@@ -1332,28 +1364,9 @@ export default function App() {
           const homeOffense = computeLineupOffenseFactor(lineups.home, statsByPlayerId);
           const awayStarterFactor = clampProbability(1 + (homePitcherEra - 4) * 0.085, 0.8, 1.25);
           const homeStarterFactor = clampProbability(1 + (awayPitcherEra - 4) * 0.085, 0.8, 1.25);
-          const weatherNode = gameWeatherByGamePk?.[gamePk];
-          const weatherTemp = Number(weatherNode?.temperatureC);
-          const weatherWind = Number(weatherNode?.windSpeedKph);
-          const weatherRain = Number(weatherNode?.precipitationProbability);
-          const isIndoor = Boolean(weatherNode?.isIndoorLikely);
-          let weatherFactor = 1;
-          if (!isIndoor) {
-            if (Number.isFinite(weatherTemp)) {
-              weatherFactor += clampProbability((weatherTemp - 20) * 0.0032, -0.04, 0.05);
-            }
-            if (Number.isFinite(weatherWind)) {
-              weatherFactor += clampProbability((weatherWind - 14) * 0.0023, -0.015, 0.035);
-            }
-            if (Number.isFinite(weatherRain) && weatherRain >= 55) {
-              weatherFactor -= 0.02;
-            }
-          }
-          weatherFactor = clampProbability(weatherFactor, 0.9, 1.12);
           const projectedTotal =
             8.5 *
-            ((awayOffense * awayStarterFactor + homeOffense * homeStarterFactor) / 2) *
-            weatherFactor;
+            ((awayOffense * awayStarterFactor + homeOffense * homeStarterFactor) / 2);
           const lean = projectedTotal >= totalLine + 0.2 ? "Over" : projectedTotal <= totalLine - 0.2 ? "Under" : "Nula";
           if (lean === "Nula") {
             continue;
@@ -1457,7 +1470,6 @@ export default function App() {
     pitcherStrikeoutValueById,
     pitcherErasById,
     pitcherHandednessById,
-    gameWeatherByGamePk,
     gameTotalsByGamePk,
     recommendationHistory
   ]);
@@ -1474,7 +1486,6 @@ export default function App() {
       setPitcherStrikeoutLinesById(snapshot?.pitcherStrikeoutLinesById ?? {});
       setPitcherStrikeoutValueById(snapshot?.pitcherStrikeoutValueById ?? {});
       setPitcherHandednessById(snapshot?.pitcherHandednessById ?? {});
-      setGameWeatherByGamePk(snapshot?.gameWeatherByGamePk ?? {});
       setGameTotalsByGamePk(snapshot?.gameTotalsByGamePk ?? {});
     }
 
@@ -1496,7 +1507,7 @@ export default function App() {
               applyLoadedData(cached);
               updateGameLoadStep("cache", "success", "Cache local aplicado.");
               updateManyGameLoadSteps(
-                ["schedule", "eras", "strikeouts", "odds", "handedness", "weather", "evaluation"],
+                ["schedule", "eras", "strikeouts", "odds", "handedness", "evaluation"],
                 "skipped",
                 "Omitido por cache."
               );
@@ -1519,48 +1530,49 @@ export default function App() {
         ]);
         const season = selectedDate.split("-")[0];
         updateManyGameLoadSteps(
-          ["eras", "strikeouts", "odds", "handedness", "weather"],
+          ["eras", "strikeouts", "odds", "handedness"],
           "running",
           "Consultando..."
         );
+        const erasPromise = fetchPitcherErasByIds(pitcherIds, season);
+        erasPromise
+          .then(() => updateGameLoadStep("eras", "success", "OK"))
+          .catch((error) =>
+            updateGameLoadStep("eras", "error", `${error?.message || "Fallo"} (continuando).`)
+          );
+        const strikeoutsPromise = fetchPitcherStrikeoutsPerGameByIds(pitcherIds, season);
+        strikeoutsPromise
+          .then(() => updateGameLoadStep("strikeouts", "success", "OK"))
+          .catch((error) =>
+            updateGameLoadStep("strikeouts", "error", `${error?.message || "Fallo"} (continuando).`)
+          );
+        const oddsPromise = withTimeout(
+          fetchPitcherStrikeoutLinesByGames(fetchedGames),
+          25000,
+          "Timeout consultando odds"
+        );
+        oddsPromise
+          .then(() => updateGameLoadStep("odds", "success", "OK"))
+          .catch((error) =>
+            updateGameLoadStep("odds", "error", `${error?.message || "Fallo"} (continuando).`)
+          );
+        const handednessPromise = fetchPitcherHandednessByIds(pitcherIds);
+        handednessPromise
+          .then(() => updateGameLoadStep("handedness", "success", "OK"))
+          .catch((error) =>
+            updateGameLoadStep("handedness", "error", `${error?.message || "Fallo"} (continuando).`)
+          );
         const [
           erasResult,
           strikeoutsPerGameResult,
           oddsResult,
-          handednessResult,
-          weatherResult
+          handednessResult
         ] = await Promise.allSettled([
-          fetchPitcherErasByIds(pitcherIds, season),
-          fetchPitcherStrikeoutsPerGameByIds(pitcherIds, season),
-          fetchPitcherStrikeoutLinesByGames(fetchedGames),
-          fetchPitcherHandednessByIds(pitcherIds),
-          fetchGameWeatherByGames(fetchedGames, { forceRefresh })
+          erasPromise,
+          strikeoutsPromise,
+          oddsPromise,
+          handednessPromise
         ]);
-        updateGameLoadStep(
-          "eras",
-          erasResult.status === "fulfilled" ? "success" : "error",
-          erasResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
-        );
-        updateGameLoadStep(
-          "strikeouts",
-          strikeoutsPerGameResult.status === "fulfilled" ? "success" : "error",
-          strikeoutsPerGameResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
-        );
-        updateGameLoadStep(
-          "odds",
-          oddsResult.status === "fulfilled" ? "success" : "error",
-          oddsResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
-        );
-        updateGameLoadStep(
-          "handedness",
-          handednessResult.status === "fulfilled" ? "success" : "error",
-          handednessResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
-        );
-        updateGameLoadStep(
-          "weather",
-          weatherResult.status === "fulfilled" ? "success" : "error",
-          weatherResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
-        );
         const erasMap = erasResult.status === "fulfilled" ? erasResult.value : {};
         const strikeoutsPerGameMap =
           strikeoutsPerGameResult.status === "fulfilled" ? strikeoutsPerGameResult.value : {};
@@ -1569,7 +1581,6 @@ export default function App() {
             ? oddsResult.value
             : { linesByPitcherId: {}, totalsByGamePk: {}, usageSummary: null };
         const handednessMap = handednessResult.status === "fulfilled" ? handednessResult.value : {};
-        const weatherByGamePk = weatherResult.status === "fulfilled" ? weatherResult.value : {};
         const strikeoutLinesMap = oddsSnapshot?.linesByPitcherId ?? {};
         const totalsByGamePk = oddsSnapshot?.totalsByGamePk ?? {};
         if (!ignore && oddsSnapshot?.usageSummary) {
@@ -1596,7 +1607,6 @@ export default function App() {
             pitcherStrikeoutLinesById: strikeoutLinesMap,
             pitcherStrikeoutValueById: strikeoutValueMap,
             pitcherHandednessById: handednessMap,
-            gameWeatherByGamePk: weatherByGamePk,
             gameTotalsByGamePk: totalsByGamePk
           };
           applyLoadedData(nextSnapshot);
@@ -1629,7 +1639,6 @@ export default function App() {
           setPitcherStrikeoutLinesById({});
           setPitcherStrikeoutValueById({});
           setPitcherHandednessById({});
-          setGameWeatherByGamePk({});
           setGameTotalsByGamePk({});
           setOddsLoading(false);
         }
@@ -1751,7 +1760,6 @@ export default function App() {
         pitcherStrikeoutLinesById: nextLinesByPitcherId,
         pitcherStrikeoutValueById: nextStrikeoutValueById,
         pitcherHandednessById,
-        gameWeatherByGamePk,
         gameTotalsByGamePk: nextTotalsByGamePk
       });
 
@@ -1812,6 +1820,20 @@ export default function App() {
     } catch (error) {
       setAuthError("Usuario o contrasena incorrectos.");
     } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleLogout() {
+    setAuthLoading(true);
+    try {
+      await logoutFromBackend();
+    } catch (error) {
+      // Logout should always clear local session even if backend call fails.
+    } finally {
+      clearAuthSession();
+      setBackendAccessToken("");
+      setAuthSession(null);
       setAuthLoading(false);
     }
   }
@@ -2285,6 +2307,9 @@ export default function App() {
         <section className="history-panel dashboard-panel">
           <div className="history-header-row">
             <strong>Dashboard de rendimiento</strong>
+            <button type="button" className="logout-button" onClick={handleLogout} disabled={authLoading}>
+              {authLoading ? "Cerrando..." : "Cerrar sesion"}
+            </button>
           </div>
           <p className="history-summary">
             Win rate global y por dominio basado en picks resueltos (Exito/Failed).
@@ -2432,6 +2457,22 @@ export default function App() {
               </article>
             </div>
           </div>
+          <div className="dashboard-users-section">
+            <h3>Llamadas The Odds API por usuario</h3>
+            {!Array.isArray(oddsApiUsage?.callsByUser) || !oddsApiUsage.callsByUser.length ? (
+              <p className="dashboard-empty">Sin datos de llamadas por usuario aun.</p>
+            ) : (
+              <div className="dashboard-users-list">
+                {oddsApiUsage.callsByUser.map((row) => (
+                  <article key={row.username} className="dashboard-user-row">
+                    <strong>{row.username}</strong>
+                    <span>{Number(row.totalCalls || 0)} llamadas</span>
+                    <small>Ultima: {formatUnixDateTimeLabel(row.lastCallAt)}</small>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
         </section>
       ) : null}
       {activeMainView === "games" || activeMainView === "top" ? (
@@ -2510,7 +2551,6 @@ export default function App() {
           pitcherStrikeoutLinesById={pitcherStrikeoutLinesById}
           pitcherStrikeoutValueById={pitcherStrikeoutValueById}
           pitcherHandednessById={pitcherHandednessById}
-          gameWeatherByGamePk={gameWeatherByGamePk}
           gameTotalsByGamePk={gameTotalsByGamePk}
           oddsLoading={oddsLoading}
           onRefreshOddsForGame={handleRefreshOddsForGame}
