@@ -511,6 +511,29 @@ function formatPercent(probability) {
   return `${Math.round(numeric * 100)}%`;
 }
 
+function summarizeResolvedEntries(entries) {
+  const wins = (entries ?? []).filter((entry) => entry?.status === "success").length;
+  const losses = (entries ?? []).filter((entry) => entry?.status === "failed").length;
+  const resolved = wins + losses;
+  const winRate = resolved ? wins / resolved : null;
+  return { wins, losses, resolved, winRate };
+}
+
+function formatWinRateLabel(summary) {
+  if (!summary || !Number.isFinite(summary.winRate)) {
+    return "--";
+  }
+  return `${(summary.winRate * 100).toFixed(1)}%`;
+}
+
+function summarizeOutcomeCounts(entries) {
+  const wins = (entries ?? []).filter((entry) => entry?.status === "success").length;
+  const losses = (entries ?? []).filter((entry) => entry?.status === "failed").length;
+  const pending = (entries ?? []).filter((entry) => entry?.status === "pending").length;
+  const total = wins + losses + pending;
+  return { wins, losses, pending, total };
+}
+
 function normalizeLegacyPickDomain(rawDomain, marketLabel, pitcherName) {
   const domain = `${rawDomain || "strikeouts"}`.toLowerCase().trim();
   if (domain && domain !== "strikeouts") {
@@ -1696,6 +1719,102 @@ export default function App() {
     return { success, failed, pending };
   }, [selectedHistoryEntriesByGroup]);
 
+  const dashboardSummary = useMemo(() => {
+    const nonNulaHistory = recommendationHistory.filter((entry) => {
+      const recommendation = `${entry?.recommendation || ""}`.toLowerCase().trim();
+      return recommendation !== "nula";
+    });
+    const resolvedHistory = nonNulaHistory.filter(
+      (entry) => entry?.status === "success" || entry?.status === "failed"
+    );
+    const pendingCount = nonNulaHistory.filter((entry) => entry?.status === "pending").length;
+
+    const strikeoutsResolved = resolvedHistory.filter((entry) => {
+      const domain = `${entry?.pickDomain || "strikeouts"}`.toLowerCase();
+      if (domain !== "strikeouts") {
+        return false;
+      }
+      const market = `${entry?.marketLabel || ""}`.toLowerCase();
+      const player = `${entry?.pitcherName || ""}`.toLowerCase();
+      return !market.includes("total") && !player.includes("total juego");
+    });
+    const battersResolved = resolvedHistory.filter((entry) => {
+      const domain = `${entry?.pickDomain || "strikeouts"}`.toLowerCase();
+      return domain === "hits" || domain === "onbase";
+    });
+    const totalsResolved = resolvedHistory.filter((entry) => {
+      const domain = `${entry?.pickDomain || ""}`.toLowerCase();
+      return domain === "game_total" || domain === "team_total";
+    });
+    const totalsAll = nonNulaHistory.filter((entry) => {
+      const domain = `${entry?.pickDomain || ""}`.toLowerCase();
+      return domain === "game_total" || domain === "team_total";
+    });
+    const totalsOver = totalsAll.filter(
+      (entry) => `${entry?.recommendation || ""}`.toLowerCase() === "over"
+    );
+    const totalsUnder = totalsAll.filter(
+      (entry) => `${entry?.recommendation || ""}`.toLowerCase() === "under"
+    );
+    const totalsGameOnly = totalsAll.filter(
+      (entry) => `${entry?.pickDomain || ""}`.toLowerCase() === "game_total"
+    );
+    const totalsTeamOnly = totalsAll.filter(
+      (entry) => `${entry?.pickDomain || ""}`.toLowerCase() === "team_total"
+    );
+
+    const todayIsoDate = getTodayIsoDate();
+    const sevenDayWindowStart = addDays(todayIsoDate, -6);
+    const recentResolved = resolvedHistory.filter((entry) => {
+      const gameDate = `${entry?.gameDate || ""}`.slice(0, 10);
+      return gameDate && gameDate >= sevenDayWindowStart && gameDate <= todayIsoDate;
+    });
+    const byDateMap = new Map();
+    for (const entry of resolvedHistory) {
+      const dateKey = `${entry?.gameDate || ""}`.slice(0, 10);
+      if (!dateKey) {
+        continue;
+      }
+      const node = byDateMap.get(dateKey) ?? { date: dateKey, wins: 0, losses: 0, resolved: 0, winRate: null };
+      if (entry?.status === "success") {
+        node.wins += 1;
+      }
+      if (entry?.status === "failed") {
+        node.losses += 1;
+      }
+      node.resolved = node.wins + node.losses;
+      node.winRate = node.resolved ? node.wins / node.resolved : null;
+      byDateMap.set(dateKey, node);
+    }
+    const dailyTrend = [...byDateMap.values()]
+      .sort((a, b) => `${a.date}`.localeCompare(`${b.date}`))
+      .slice(-10);
+
+    const byDomain = [
+      { key: "strikeouts", label: "Strikeouts", ...summarizeResolvedEntries(strikeoutsResolved) },
+      { key: "batters", label: "Bateadores", ...summarizeResolvedEntries(battersResolved) },
+      { key: "totals", label: "Totales O/U", ...summarizeResolvedEntries(totalsResolved) }
+    ];
+
+    return {
+      overall: summarizeResolvedEntries(resolvedHistory),
+      recent7Days: summarizeResolvedEntries(recentResolved),
+      pendingCount,
+      byDomain,
+      totals: {
+        over: summarizeOutcomeCounts(totalsOver),
+        under: summarizeOutcomeCounts(totalsUnder),
+        gameOnly: summarizeOutcomeCounts(totalsGameOnly),
+        teamOnly: summarizeOutcomeCounts(totalsTeamOnly)
+      },
+      chart: {
+        overallOutcome: summarizeOutcomeCounts(nonNulaHistory),
+        byDomain,
+        dailyTrend
+      }
+    };
+  }, [recommendationHistory]);
+
   const selectedHistoryDateIndex = historyDates.indexOf(historySelectedDate);
 
   useEffect(() => {
@@ -1830,6 +1949,13 @@ export default function App() {
           onClick={() => setActiveMainView("top")}
         >
           Top Picks del dia
+        </button>
+        <button
+          type="button"
+          className={`games-view-button ${activeMainView === "dashboard" ? "active" : ""}`}
+          onClick={() => setActiveMainView("dashboard")}
+        >
+          Dashboard
         </button>
       </div>
       {activeMainView === "top" ? (
@@ -1988,7 +2114,160 @@ export default function App() {
           )}
         </section>
       ) : null}
-      {activeMainView !== "history" ? (
+      {activeMainView === "dashboard" ? (
+        <section className="history-panel dashboard-panel">
+          <div className="history-header-row">
+            <strong>Dashboard de rendimiento</strong>
+          </div>
+          <p className="history-summary">
+            Win rate global y por dominio basado en picks resueltos (Exito/Failed).
+          </p>
+          <div className="dashboard-metrics-grid">
+            <article className="dashboard-metric-card">
+              <span className="dashboard-metric-label">Win rate general</span>
+              <strong className="dashboard-metric-value">{formatWinRateLabel(dashboardSummary.overall)}</strong>
+              <small>
+                {dashboardSummary.overall.wins} Exitos · {dashboardSummary.overall.losses} Failed ·{" "}
+                {dashboardSummary.overall.resolved} resueltos
+              </small>
+            </article>
+            <article className="dashboard-metric-card">
+              <span className="dashboard-metric-label">Ultimos 7 dias</span>
+              <strong className="dashboard-metric-value">{formatWinRateLabel(dashboardSummary.recent7Days)}</strong>
+              <small>
+                {dashboardSummary.recent7Days.wins} Exitos · {dashboardSummary.recent7Days.losses} Failed ·{" "}
+                {dashboardSummary.recent7Days.resolved} resueltos
+              </small>
+            </article>
+            <article className="dashboard-metric-card">
+              <span className="dashboard-metric-label">Picks pendientes</span>
+              <strong className="dashboard-metric-value">{dashboardSummary.pendingCount}</strong>
+              <small>Se actualizaran automaticamente cuando termine el juego.</small>
+            </article>
+          </div>
+          <div className="dashboard-breakdown">
+            {dashboardSummary.byDomain.map((domain) => (
+              <article key={domain.key} className="dashboard-breakdown-row">
+                <strong>{domain.label}</strong>
+                <span>{formatWinRateLabel(domain)}</span>
+                <small>
+                  {domain.wins} Exitos · {domain.losses} Failed · {domain.resolved} resueltos
+                </small>
+              </article>
+            ))}
+          </div>
+          <div className="dashboard-chart-block">
+            <h3>Grafica general</h3>
+            <div className="dashboard-stacked-bar">
+              <span
+                className="segment wins"
+                style={{
+                  width: `${dashboardSummary.chart.overallOutcome.total
+                    ? (dashboardSummary.chart.overallOutcome.wins /
+                        dashboardSummary.chart.overallOutcome.total) *
+                      100
+                    : 0}%`
+                }}
+                title={`Exitos: ${dashboardSummary.chart.overallOutcome.wins}`}
+              />
+              <span
+                className="segment losses"
+                style={{
+                  width: `${dashboardSummary.chart.overallOutcome.total
+                    ? (dashboardSummary.chart.overallOutcome.losses /
+                        dashboardSummary.chart.overallOutcome.total) *
+                      100
+                    : 0}%`
+                }}
+                title={`Failed: ${dashboardSummary.chart.overallOutcome.losses}`}
+              />
+              <span
+                className="segment pending"
+                style={{
+                  width: `${dashboardSummary.chart.overallOutcome.total
+                    ? (dashboardSummary.chart.overallOutcome.pending /
+                        dashboardSummary.chart.overallOutcome.total) *
+                      100
+                    : 0}%`
+                }}
+                title={`Pendientes: ${dashboardSummary.chart.overallOutcome.pending}`}
+              />
+            </div>
+            <p className="dashboard-chart-legend">
+              Exitos: {dashboardSummary.chart.overallOutcome.wins} · Failed:{" "}
+              {dashboardSummary.chart.overallOutcome.losses} · Pendientes:{" "}
+              {dashboardSummary.chart.overallOutcome.pending}
+            </p>
+            <div className="dashboard-domain-bars">
+              {dashboardSummary.chart.byDomain.map((domain) => (
+                <article key={domain.key} className="dashboard-domain-bar-row">
+                  <strong>{domain.label}</strong>
+                  <div className="dashboard-domain-bar-track">
+                    <span
+                      className="dashboard-domain-bar-fill"
+                      style={{ width: `${Number.isFinite(domain.winRate) ? domain.winRate * 100 : 0}%` }}
+                    />
+                  </div>
+                  <small>{formatWinRateLabel(domain)}</small>
+                </article>
+              ))}
+            </div>
+            <div className="dashboard-trend-chart">
+              {dashboardSummary.chart.dailyTrend.length ? (
+                dashboardSummary.chart.dailyTrend.map((point) => (
+                  <article key={point.date} className="dashboard-trend-bar-wrap" title={`${point.date} · ${formatWinRateLabel(point)}`}>
+                    <div
+                      className="dashboard-trend-bar"
+                      style={{ height: `${Math.max(8, (Number.isFinite(point.winRate) ? point.winRate : 0) * 100)}%` }}
+                    />
+                    <small>{point.date.slice(5)}</small>
+                  </article>
+                ))
+              ) : (
+                <p className="dashboard-empty">No hay suficientes picks resueltos para tendencia diaria.</p>
+              )}
+            </div>
+          </div>
+          <div className="dashboard-totals-section">
+            <h3>Totales Over/Under de carreras</h3>
+            <div className="dashboard-totals-grid">
+              <article className="dashboard-totals-card over">
+                <strong>Over</strong>
+                <span>{dashboardSummary.totals.over.total} picks</span>
+                <small>
+                  Exitos: {dashboardSummary.totals.over.wins} · Failed: {dashboardSummary.totals.over.losses} · Pend:{" "}
+                  {dashboardSummary.totals.over.pending}
+                </small>
+              </article>
+              <article className="dashboard-totals-card under">
+                <strong>Under</strong>
+                <span>{dashboardSummary.totals.under.total} picks</span>
+                <small>
+                  Exitos: {dashboardSummary.totals.under.wins} · Failed: {dashboardSummary.totals.under.losses} · Pend:{" "}
+                  {dashboardSummary.totals.under.pending}
+                </small>
+              </article>
+              <article className="dashboard-totals-card neutral">
+                <strong>Total Juego O/U</strong>
+                <span>{dashboardSummary.totals.gameOnly.total} picks</span>
+                <small>
+                  Exitos: {dashboardSummary.totals.gameOnly.wins} · Failed: {dashboardSummary.totals.gameOnly.losses} · Pend:{" "}
+                  {dashboardSummary.totals.gameOnly.pending}
+                </small>
+              </article>
+              <article className="dashboard-totals-card neutral">
+                <strong>Total Equipo O/U</strong>
+                <span>{dashboardSummary.totals.teamOnly.total} picks</span>
+                <small>
+                  Exitos: {dashboardSummary.totals.teamOnly.wins} · Failed: {dashboardSummary.totals.teamOnly.losses} · Pend:{" "}
+                  {dashboardSummary.totals.teamOnly.pending}
+                </small>
+              </article>
+            </div>
+          </div>
+        </section>
+      ) : null}
+      {activeMainView === "games" || activeMainView === "top" ? (
         <>
       <div className="games-view-toggle games-controls" role="tablist" aria-label="Filtro de juegos">
         <button

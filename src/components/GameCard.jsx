@@ -1185,6 +1185,12 @@ export default function GameCard({
   const statusLabel = liveInningLabel
     ? `${game.status.detailedState} - ${liveInningLabel}`
     : game.status.detailedState;
+  const statusText = `${game?.status?.detailedState || ""}`.toLowerCase();
+  const statusToneClass = isGameLive(game)
+    ? "live"
+    : statusText.includes("final")
+      ? "final"
+      : "scheduled";
   const weatherLine = formatGameWeatherLine(gameWeatherByGamePk?.[game?.gamePk]);
   const effectiveOddsLoading = oddsLoading || oddsRefreshLoading;
   const activeOpposingPitcherHandedness =
@@ -1442,8 +1448,8 @@ export default function GameCard({
   return (
     <article className="game-card">
       <div className="game-meta">
-        <strong>{localTime}</strong>
-        <span>{statusLabel}</span>
+        <strong className="game-time-pill">{localTime}</strong>
+        <span className={`game-status-pill ${statusToneClass}`}>{statusLabel}</span>
       </div>
 
       <div className="scoreboard">
@@ -1486,7 +1492,7 @@ export default function GameCard({
         />
       </div>
 
-      <div className="odds-actions">
+      <div className="game-actions-grid">
         <button
           type="button"
           className="lineup-toggle odds-refresh-button"
@@ -1495,20 +1501,45 @@ export default function GameCard({
         >
           {oddsRefreshLoading ? "Refrescando odds..." : "Refrescar odds (este juego)"}
         </button>
-      </div>
+        <button
+          type="button"
+          className="lineup-toggle bullpen-toggle-button"
+          onClick={handleToggleBullpen}
+          disabled={bullpenLoading}
+        >
+          {bullpenLoading
+            ? "Calculando bullpen probable..."
+            : bullpenOpen
+              ? "Ocultar bullpen probable"
+              : "Ver bullpen probable"}
+        </button>
 
-      <button
-        type="button"
-        className="lineup-toggle"
-        onClick={handleToggleBullpen}
-        disabled={bullpenLoading}
-      >
-        {bullpenLoading
-          ? "Calculando bullpen probable..."
-          : bullpenOpen
-            ? "Ocultar bullpen probable"
-            : "Ver bullpen probable"}
-      </button>
+        <button
+          type="button"
+          className="lineup-toggle runs-toggle-button"
+          onClick={handleToggleRunsProjection}
+          disabled={runsProjectionLoading}
+        >
+          {runsProjectionLoading
+            ? "Calculando proyeccion O/U..."
+            : runsProjectionOpen
+              ? "Ocultar proyeccion de carreras"
+              : "Ver proyeccion de carreras (O/U)"}
+        </button>
+
+        <button
+          type="button"
+          className="lineup-toggle lineup-main-toggle"
+          onClick={handleToggleLineup}
+          disabled={lineupLoading}
+        >
+          {lineupLoading
+            ? "Cargando lineup..."
+            : lineupOpen
+              ? "Ocultar lineups"
+              : "Ver lineups"}
+        </button>
+      </div>
 
       {bullpenOpen ? (
         <div className="bullpen-panel">
@@ -1561,19 +1592,6 @@ export default function GameCard({
         </div>
       ) : null}
 
-      <button
-        type="button"
-        className="lineup-toggle"
-        onClick={handleToggleRunsProjection}
-        disabled={runsProjectionLoading}
-      >
-        {runsProjectionLoading
-          ? "Calculando proyeccion O/U..."
-          : runsProjectionOpen
-            ? "Ocultar proyeccion de carreras"
-            : "Ver proyeccion de carreras (O/U)"}
-      </button>
-
       {runsProjectionOpen ? (
         <div className="runs-projection-panel">
           {runsProjectionError ? <p className="error">{runsProjectionError}</p> : null}
@@ -1623,19 +1641,6 @@ export default function GameCard({
           ) : null}
         </div>
       ) : null}
-
-      <button
-        type="button"
-        className="lineup-toggle"
-        onClick={handleToggleLineup}
-        disabled={lineupLoading}
-      >
-        {lineupLoading
-          ? "Cargando lineup..."
-          : lineupOpen
-            ? "Ocultar lineups"
-            : "Ver lineups"}
-      </button>
 
       {lineupOpen ? (
         <div className="lineup-panel">
