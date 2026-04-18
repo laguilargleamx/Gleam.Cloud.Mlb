@@ -253,6 +253,18 @@ body {
   border-color: #1d4ed8;
 }
 
+.odds-usage-counter {
+  margin-left: auto;
+  border: 1px solid #d6deea;
+  background: #f8fbff;
+  color: #334155;
+  border-radius: 999px;
+  padding: 0.32rem 0.64rem;
+  font-size: 0.79rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .match-filter-strip {
   margin: 0 0 0.8rem;
   display: flex;
@@ -391,6 +403,78 @@ body {
   background: #ffffff;
   padding: 0.8rem;
   margin: 0 auto 0.8rem;
+}
+
+.load-progress-panel {
+  border: 1px solid #d6dee8;
+  background: #ffffff;
+  border-radius: 12px;
+  padding: 0.7rem;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.load-progress-list {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.load-progress-row {
+  display: grid;
+  grid-template-columns: 54px minmax(130px, 170px) minmax(0, 1fr);
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.82rem;
+}
+
+.load-progress-label {
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.load-progress-row small {
+  color: #475569;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.load-progress-state {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+  font-weight: 700;
+  font-size: 0.68rem;
+  padding: 0.14rem 0.42rem;
+  min-width: 48px;
+}
+
+.load-progress-state.success {
+  border-color: #86efac;
+  background: #dcfce7;
+  color: #166534;
+}
+
+.load-progress-state.running {
+  border-color: #93c5fd;
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.load-progress-state.error {
+  border-color: #fca5a5;
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.load-progress-state.skipped {
+  border-color: #d1d5db;
+  background: #f3f4f6;
+  color: #4b5563;
 }
 
 .history-summary {
@@ -1862,6 +1946,21 @@ body {
     align-items: flex-start;
     flex-direction: column;
     gap: 0.4rem;
+  }
+
+  .load-progress-row {
+    grid-template-columns: 52px 1fr;
+    gap: 0.4rem;
+  }
+
+  .load-progress-row small {
+    grid-column: 1 / -1;
+  }
+
+  .odds-usage-counter {
+    margin-left: 0;
+    width: 100%;
+    text-align: center;
   }
 
   .top-picks-grid {

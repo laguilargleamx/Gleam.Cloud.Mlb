@@ -18,6 +18,7 @@ import {
   getTeamAbbreviation,
   getTeamLogoUrl,
   fetchBackendSession,
+  fetchOddsApiUsageSummary,
   fetchRecommendationHistoryFromBackend,
   loginToBackend,
   pruneSampleRecommendationHistoryFromBackend,
@@ -511,6 +512,34 @@ function formatPercent(probability) {
   return `${Math.round(numeric * 100)}%`;
 }
 
+function formatOddsUsageLabel(usage) {
+  if (!usage || typeof usage !== "object") {
+    return "Odds API: --";
+  }
+  const tokenLabel = `${usage?.currentTokenLabel || ""}`.trim();
+  const tokenCalls = Number(usage?.currentTokenCalls || 0);
+  const remaining = Number(usage?.requestsRemaining);
+  const prefix = tokenLabel ? `${tokenLabel}` : "Odds API";
+  if (Number.isFinite(remaining)) {
+    return `${prefix} · Restantes ${remaining} · Llamadas ${tokenCalls}`;
+  }
+  return `${prefix} · Llamadas ${tokenCalls}`;
+}
+
+function formatOddsUsageTooltip(usage) {
+  if (!usage || typeof usage !== "object") {
+    return "Sin datos de uso de The Odds API.";
+  }
+  const history = Array.isArray(usage?.tokenHistory) ? usage.tokenHistory : [];
+  if (!history.length) {
+    return "Sin historial de tokens aun.";
+  }
+  const rows = history
+    .slice(0, 4)
+    .map((row) => `${row?.tokenLabel || row?.tokenFingerprint || "token"}: ${Number(row?.totalCalls || 0)} llamadas`);
+  return `Historial tokens: ${rows.join(" | ")}`;
+}
+
 function summarizeResolvedEntries(entries) {
   const wins = (entries ?? []).filter((entry) => entry?.status === "success").length;
   const losses = (entries ?? []).filter((entry) => entry?.status === "failed").length;
@@ -866,6 +895,21 @@ function writeAppDataCache(selectedDate, payload) {
   }
 }
 
+const GAME_LOAD_STEPS_TEMPLATE = [
+  { id: "cache", label: "Cache local", status: "pending", detail: "" },
+  { id: "schedule", label: "Juegos MLB", status: "pending", detail: "" },
+  { id: "eras", label: "ERA abridores", status: "pending", detail: "" },
+  { id: "strikeouts", label: "SO por juego", status: "pending", detail: "" },
+  { id: "odds", label: "Odds y lineas", status: "pending", detail: "" },
+  { id: "handedness", label: "Mano pitcher", status: "pending", detail: "" },
+  { id: "weather", label: "Clima", status: "pending", detail: "" },
+  { id: "evaluation", label: "Evaluacion modelo K", status: "pending", detail: "" }
+];
+
+function createGameLoadSteps() {
+  return GAME_LOAD_STEPS_TEMPLATE.map((step) => ({ ...step }));
+}
+
 export default function App() {
   const todayDate = useMemo(() => getTodayIsoDate(), []);
   const minSelectableDate = useMemo(() => todayDate, [todayDate]);
@@ -901,11 +945,30 @@ export default function App() {
   });
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [historySyncLoading, setHistorySyncLoading] = useState(false);
+  const [historyLoadProgress, setHistoryLoadProgress] = useState({
+    status: "pending",
+    detail: "Pendiente"
+  });
+  const [oddsApiUsage, setOddsApiUsage] = useState(null);
+  const [gameLoadSteps, setGameLoadSteps] = useState(() => createGameLoadSteps());
   const [recommendationHistory, setRecommendationHistory] = useState(() =>
     normalizeHistoryEntries(readRecommendationHistory())
   );
   const [error, setError] = useState("");
   const isAuthenticated = Boolean(authSession?.authenticated && authSession?.accessToken);
+
+  function updateGameLoadStep(stepId, status, detail = "") {
+    setGameLoadSteps((current) =>
+      current.map((step) => (step.id === stepId ? { ...step, status, detail } : step))
+    );
+  }
+
+  function updateManyGameLoadSteps(stepIds, status, detail = "") {
+    const idSet = new Set(stepIds);
+    setGameLoadSteps((current) =>
+      current.map((step) => (idSet.has(step.id) ? { ...step, status, detail } : step))
+    );
+  }
 
   useEffect(() => {
     setBackendAccessToken(authSession?.accessToken || "");
@@ -939,12 +1002,15 @@ export default function App() {
 
   useEffect(() => {
     if (!isAuthenticated) {
+      setHistoryLoadProgress({ status: "pending", detail: "Inicia sesion para sincronizar historial." });
+      setOddsApiUsage(null);
       return undefined;
     }
     let ignore = false;
 
     async function loadRecommendationHistory() {
       setHistorySyncLoading(true);
+      setHistoryLoadProgress({ status: "running", detail: "Sincronizando historial..." });
       try {
         await pruneSampleRecommendationHistoryFromBackend();
         const remoteEntries = await fetchRecommendationHistoryFromBackend();
@@ -955,14 +1021,26 @@ export default function App() {
         if (normalizedRemote.length) {
           setRecommendationHistory(normalizedRemote);
           writeRecommendationHistory(normalizedRemote);
+          setHistoryLoadProgress({
+            status: "success",
+            detail: `Historial remoto cargado (${normalizedRemote.length}).`
+          });
         } else {
           const localEntries = normalizeHistoryEntries(readRecommendationHistory());
           setRecommendationHistory(localEntries);
+          setHistoryLoadProgress({
+            status: "success",
+            detail: `Sin data remota. Historial local (${localEntries.length}).`
+          });
         }
       } catch (error) {
         if (!ignore) {
           const localEntries = normalizeHistoryEntries(readRecommendationHistory());
           setRecommendationHistory(localEntries);
+          setHistoryLoadProgress({
+            status: "error",
+            detail: `Fallo backend. Usando historial local (${localEntries.length}).`
+          });
         }
       } finally {
         if (!ignore) {
@@ -977,6 +1055,33 @@ export default function App() {
       ignore = true;
     };
   }, [isAuthenticated, authSession?.accessToken]);
+
+  useEffect(() => {
+    if (!isAuthenticated) {
+      return undefined;
+    }
+    let ignore = false;
+
+    async function refreshOddsUsageSummary() {
+      try {
+        const summary = await fetchOddsApiUsageSummary();
+        if (!ignore) {
+          setOddsApiUsage(summary || null);
+        }
+      } catch (error) {
+        if (!ignore) {
+          setOddsApiUsage(null);
+        }
+      }
+    }
+
+    refreshOddsUsageSummary();
+    const timer = setInterval(refreshOddsUsageSummary, 60000);
+    return () => {
+      ignore = true;
+      clearInterval(timer);
+    };
+  }, [isAuthenticated]);
 
   useEffect(() => {
     if (!isAuthenticated || !historyLoaded) {
@@ -1377,27 +1482,47 @@ export default function App() {
       setLoading(true);
       setOddsLoading(true);
       setError("");
+      setGameLoadSteps(createGameLoadSteps());
       try {
+        if (forceRefresh) {
+          updateGameLoadStep("cache", "skipped", "Refresh manual solicitado.");
+        } else {
+          updateGameLoadStep("cache", "running", "Revisando cache local...");
+        }
         if (!forceRefresh) {
           const cached = readAppDataCache(selectedDate);
           if (cached) {
             if (!ignore) {
               applyLoadedData(cached);
+              updateGameLoadStep("cache", "success", "Cache local aplicado.");
+              updateManyGameLoadSteps(
+                ["schedule", "eras", "strikeouts", "odds", "handedness", "weather", "evaluation"],
+                "skipped",
+                "Omitido por cache."
+              );
               setOddsLoading(false);
               setLoading(false);
             }
             return;
           }
+          updateGameLoadStep("cache", "success", "Sin cache valido. Consultando APIs.");
         }
 
+        updateGameLoadStep("schedule", "running", "Consultando calendario MLB...");
         const payload = await fetchMlbScheduleByDate(selectedDate);
         const dateNode = payload.dates?.[0];
         const fetchedGames = dateNode?.games ?? [];
+        updateGameLoadStep("schedule", "success", `${fetchedGames.length} juegos recibidos.`);
         const pitcherIds = fetchedGames.flatMap((game) => [
           game.teams?.away?.probablePitcher?.id,
           game.teams?.home?.probablePitcher?.id
         ]);
         const season = selectedDate.split("-")[0];
+        updateManyGameLoadSteps(
+          ["eras", "strikeouts", "odds", "handedness", "weather"],
+          "running",
+          "Consultando..."
+        );
         const [
           erasResult,
           strikeoutsPerGameResult,
@@ -1411,25 +1536,57 @@ export default function App() {
           fetchPitcherHandednessByIds(pitcherIds),
           fetchGameWeatherByGames(fetchedGames, { forceRefresh })
         ]);
+        updateGameLoadStep(
+          "eras",
+          erasResult.status === "fulfilled" ? "success" : "error",
+          erasResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
+        );
+        updateGameLoadStep(
+          "strikeouts",
+          strikeoutsPerGameResult.status === "fulfilled" ? "success" : "error",
+          strikeoutsPerGameResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
+        );
+        updateGameLoadStep(
+          "odds",
+          oddsResult.status === "fulfilled" ? "success" : "error",
+          oddsResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
+        );
+        updateGameLoadStep(
+          "handedness",
+          handednessResult.status === "fulfilled" ? "success" : "error",
+          handednessResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
+        );
+        updateGameLoadStep(
+          "weather",
+          weatherResult.status === "fulfilled" ? "success" : "error",
+          weatherResult.status === "fulfilled" ? "OK" : "Fallo (continuando)."
+        );
         const erasMap = erasResult.status === "fulfilled" ? erasResult.value : {};
         const strikeoutsPerGameMap =
           strikeoutsPerGameResult.status === "fulfilled" ? strikeoutsPerGameResult.value : {};
         const oddsSnapshot =
           oddsResult.status === "fulfilled"
             ? oddsResult.value
-            : { linesByPitcherId: {}, totalsByGamePk: {} };
+            : { linesByPitcherId: {}, totalsByGamePk: {}, usageSummary: null };
         const handednessMap = handednessResult.status === "fulfilled" ? handednessResult.value : {};
         const weatherByGamePk = weatherResult.status === "fulfilled" ? weatherResult.value : {};
         const strikeoutLinesMap = oddsSnapshot?.linesByPitcherId ?? {};
         const totalsByGamePk = oddsSnapshot?.totalsByGamePk ?? {};
-        const strikeoutValueMap =
-          strikeoutLinesMap && Object.keys(strikeoutLinesMap).length
-            ? await evaluatePitcherStrikeoutValueByGames(
-                fetchedGames,
-                strikeoutLinesMap,
-                { season, pitcherHandednessById: handednessMap }
-              )
-            : {};
+        if (!ignore && oddsSnapshot?.usageSummary) {
+          setOddsApiUsage(oddsSnapshot.usageSummary);
+        }
+        let strikeoutValueMap = {};
+        if (strikeoutLinesMap && Object.keys(strikeoutLinesMap).length) {
+          updateGameLoadStep("evaluation", "running", "Calculando recomendaciones K...");
+          strikeoutValueMap = await evaluatePitcherStrikeoutValueByGames(
+            fetchedGames,
+            strikeoutLinesMap,
+            { season, pitcherHandednessById: handednessMap }
+          );
+          updateGameLoadStep("evaluation", "success", "OK");
+        } else {
+          updateGameLoadStep("evaluation", "skipped", "Sin lineas para evaluar.");
+        }
 
         if (!ignore) {
           const nextSnapshot = {
@@ -1448,6 +1605,13 @@ export default function App() {
         }
       } catch (err) {
         if (!ignore) {
+          setGameLoadSteps((current) =>
+            current.map((step) =>
+              step.status === "running"
+                ? { ...step, status: "error", detail: `${err?.message || "Fallo inesperado"}` }
+                : step
+            )
+          );
           const rawMessage = `${err?.message || ""}`.toLowerCase();
           const isAuthIssue =
             rawMessage.includes("missing bearer token") ||
@@ -1558,6 +1722,9 @@ export default function App() {
         ...gameTotalsByGamePk,
         ...(result?.totalsByGamePk ?? {})
       };
+      if (result?.usageSummary) {
+        setOddsApiUsage(result.usageSummary);
+      }
 
       const season = selectedDate.split("-")[0];
       const refreshedValueMap = await evaluatePitcherStrikeoutValueByGames(
@@ -2294,10 +2461,47 @@ export default function App() {
         >
           {loading ? "Refrescando data..." : "Refrescar data (fecha)"}
         </button>
+        <div className="odds-usage-counter" title={formatOddsUsageTooltip(oddsApiUsage)}>
+          {formatOddsUsageLabel(oddsApiUsage)}
+        </div>
       </div>
       {error ? <p className="error">{error}</p> : null}
       {loading ? (
-        <p>Cargando juegos...</p>
+        <section className="load-progress-panel">
+          <strong>Progreso de carga</strong>
+          <div className="load-progress-list">
+            <div className="load-progress-row">
+              <span className={`load-progress-state ${historyLoadProgress.status}`}>
+                {historyLoadProgress.status === "success"
+                  ? "OK"
+                  : historyLoadProgress.status === "running"
+                    ? "..."
+                    : historyLoadProgress.status === "error"
+                      ? "ERR"
+                      : "PEND"}
+              </span>
+              <span className="load-progress-label">Historial</span>
+              <small>{historyLoadProgress.detail || "-"}</small>
+            </div>
+            {gameLoadSteps.map((step) => (
+              <div key={step.id} className="load-progress-row">
+                <span className={`load-progress-state ${step.status}`}>
+                  {step.status === "success"
+                    ? "OK"
+                    : step.status === "running"
+                      ? "..."
+                      : step.status === "error"
+                        ? "ERR"
+                        : step.status === "skipped"
+                          ? "SKIP"
+                          : "PEND"}
+                </span>
+                <span className="load-progress-label">{step.label}</span>
+                <small>{step.detail || "-"}</small>
+              </div>
+            ))}
+          </div>
+        </section>
       ) : (
         <GamesList
           games={visibleGames}

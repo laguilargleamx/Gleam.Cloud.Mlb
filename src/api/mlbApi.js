@@ -298,6 +298,20 @@ export async function logoutFromBackend() {
   return payload;
 }
 
+export async function fetchOddsApiUsageSummary() {
+  const url = buildBackendApiUrl("/odds/usage/summary");
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: buildAuthenticatedHeaders()
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = payload?.detail || `Backend odds usage error ${response.status}`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
 export async function fetchRecommendationHistoryFromBackend() {
   const url = buildBackendApiUrl("/recommendations/history");
   const response = await fetch(url.toString(), {
@@ -530,12 +544,12 @@ export async function fetchPitcherStrikeoutLinesByGames(
 ) {
   try {
     if (!Array.isArray(games) || !games.length) {
-      return { linesByPitcherId: {}, totalsByGamePk: {} };
+      return { linesByPitcherId: {}, totalsByGamePk: {}, usageSummary: null };
     }
 
     const upcomingGames = games.filter((game) => !hasGameStarted(game));
     if (!upcomingGames.length) {
-      return { linesByPitcherId: {}, totalsByGamePk: {} };
+      return { linesByPitcherId: {}, totalsByGamePk: {}, usageSummary: null };
     }
 
     const cacheKey = `${preferredBookmakerKey}-${regions}-${upcomingGames
@@ -551,7 +565,7 @@ export async function fetchPitcherStrikeoutLinesByGames(
           .map((gamePk) => [gamePk, gameTotalsOddsCache.get(gamePk)])
           .filter(([, total]) => Boolean(total))
       );
-      return { linesByPitcherId: cached, totalsByGamePk };
+      return { linesByPitcherId: cached, totalsByGamePk, usageSummary: null };
     }
 
     const payload = await fetchBackendOddsJson("/odds/lines/by-games", {
@@ -562,14 +576,15 @@ export async function fetchPitcherStrikeoutLinesByGames(
     });
     const linesByPitcherId = normalizeBackendLinesMap(payload?.linesByPitcherId);
     const totalsByGamePk = normalizeBackendTotalsMap(payload?.totalsByGamePk);
+    const usageSummary = payload?.usageSummary ?? null;
     Object.entries(totalsByGamePk).forEach(([gamePk, node]) => {
       gameTotalsOddsCache.set(Number(gamePk), node);
     });
 
     setCachedOddsLines(cacheKey, linesByPitcherId);
-    return { linesByPitcherId, totalsByGamePk };
+    return { linesByPitcherId, totalsByGamePk, usageSummary };
   } catch (error) {
-    return { linesByPitcherId: {}, totalsByGamePk: {} };
+    return { linesByPitcherId: {}, totalsByGamePk: {}, usageSummary: null };
   }
 }
 
@@ -586,11 +601,11 @@ export async function fetchPitcherStrikeoutLinesForGame(
   try {
     if (!game) {
       debug.error = "Missing game";
-      return { linesByPitcherId: {}, debug };
+      return { linesByPitcherId: {}, totalsByGamePk: {}, usageSummary: null, debug };
     }
     if (hasGameStarted(game)) {
       debug.error = "Juego iniciado";
-      return { linesByPitcherId: {}, debug };
+      return { linesByPitcherId: {}, totalsByGamePk: {}, usageSummary: null, debug };
     }
 
     const cacheKey = `${preferredBookmakerKey}-${regions}-${game?.gamePk}`;
@@ -602,7 +617,7 @@ export async function fetchPitcherStrikeoutLinesForGame(
         if (gamePk && gameTotalsOddsCache.has(gamePk)) {
           totalsByGamePk[gamePk] = gameTotalsOddsCache.get(gamePk);
         }
-        return { linesByPitcherId: cached, totalsByGamePk, debug };
+        return { linesByPitcherId: cached, totalsByGamePk, usageSummary: null, debug };
       }
     } else {
       invalidateOddsCacheForGame(game?.gamePk);
@@ -617,6 +632,7 @@ export async function fetchPitcherStrikeoutLinesForGame(
     });
     const linesByPitcherId = normalizeBackendLinesMap(payload?.linesByPitcherId);
     const totalsByGamePk = normalizeBackendTotalsMap(payload?.totalsByGamePk);
+    const usageSummary = payload?.usageSummary ?? null;
     Object.entries(totalsByGamePk).forEach(([gamePk, node]) => {
       gameTotalsOddsCache.set(Number(gamePk), node);
     });
@@ -630,10 +646,10 @@ export async function fetchPitcherStrikeoutLinesForGame(
       pitcherStrikeoutLineCache.delete(cacheKey);
     }
 
-    return { linesByPitcherId, totalsByGamePk, debug };
+    return { linesByPitcherId, totalsByGamePk, usageSummary, debug };
   } catch (error) {
     debug.error = error instanceof Error ? error.message : "Unexpected error";
-    return { linesByPitcherId: {}, totalsByGamePk: {}, debug };
+    return { linesByPitcherId: {}, totalsByGamePk: {}, usageSummary: null, debug };
   }
 }
 

@@ -521,6 +521,320 @@ async def fetch_odds_json(path: str, params: dict[str, Any]) -> Any:
         return response.json()
 
 
+def log_odds_api_call(
+    conn: pymysql.connections.Connection,
+    *,
+    token_fingerprint: str,
+    endpoint: str,
+    status_code: int | None,
+    requests_remaining: int | None,
+    requests_used: int | None,
+    requests_last: int | None,
+    error_message: str = "",
+) -> None:
+    called_at = utc_now().replace(tzinfo=None)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO odds_api_call_log (
+              token_fingerprint, endpoint, status_code, requests_remaining, requests_used, requests_last, error_message, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                token_fingerprint[:80],
+                endpoint[:120],
+                status_code,
+                requests_remaining,
+                requests_used,
+                requests_last,
+                (error_message or "")[:255] or None,
+                called_at,
+            ),
+        )
+    upsert_odds_token_usage(
+        conn,
+        token_fingerprint=token_fingerprint,
+        status_code=status_code,
+        requests_remaining=requests_remaining,
+        requests_used=requests_used,
+        requests_last=requests_last,
+        error_message=error_message,
+        called_at=called_at,
+    )
+
+
+def build_odds_token_fingerprint() -> tuple[str, str]:
+    if not ODDS_API_KEY:
+        return "", ""
+    digest = hashlib.sha256(ODDS_API_KEY.encode("utf-8")).hexdigest()
+    fingerprint = digest[:40]
+    token_label = f"tk_{digest[:6]}...{digest[-4:]}"
+    return fingerprint, token_label
+
+
+def upsert_odds_token_usage(
+    conn: pymysql.connections.Connection,
+    *,
+    token_fingerprint: str,
+    status_code: int | None,
+    requests_remaining: int | None,
+    requests_used: int | None,
+    requests_last: int | None,
+    error_message: str = "",
+    called_at: datetime | None = None,
+) -> None:
+    if not token_fingerprint:
+        return
+    called_at_value = (called_at or utc_now()).replace(tzinfo=None)
+    token_label = f"tk_{token_fingerprint[:6]}...{token_fingerprint[-4:]}"
+    is_success = 1 if status_code is not None and 200 <= int(status_code) < 400 else 0
+    is_failed = 1 if not is_success else 0
+    exhausted_at_value = (
+        called_at_value if requests_remaining is not None and int(requests_remaining) <= 0 else None
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO odds_api_token_usage (
+              token_fingerprint, token_label, total_calls, success_calls, failed_calls,
+              last_requests_remaining, last_requests_used, last_requests_last,
+              min_requests_remaining, max_requests_used, last_status_code, last_error_message,
+              first_called_at, last_called_at, exhausted_at, updated_at
+            )
+            VALUES (%s, %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+              token_label = VALUES(token_label),
+              total_calls = total_calls + 1,
+              success_calls = success_calls + VALUES(success_calls),
+              failed_calls = failed_calls + VALUES(failed_calls),
+              last_requests_remaining = VALUES(last_requests_remaining),
+              last_requests_used = VALUES(last_requests_used),
+              last_requests_last = VALUES(last_requests_last),
+              min_requests_remaining = CASE
+                WHEN VALUES(min_requests_remaining) IS NULL THEN min_requests_remaining
+                WHEN min_requests_remaining IS NULL THEN VALUES(min_requests_remaining)
+                ELSE LEAST(min_requests_remaining, VALUES(min_requests_remaining))
+              END,
+              max_requests_used = CASE
+                WHEN VALUES(max_requests_used) IS NULL THEN max_requests_used
+                WHEN max_requests_used IS NULL THEN VALUES(max_requests_used)
+                ELSE GREATEST(max_requests_used, VALUES(max_requests_used))
+              END,
+              last_status_code = VALUES(last_status_code),
+              last_error_message = VALUES(last_error_message),
+              last_called_at = VALUES(last_called_at),
+              exhausted_at = COALESCE(VALUES(exhausted_at), exhausted_at),
+              updated_at = VALUES(updated_at)
+            """,
+            (
+                token_fingerprint[:80],
+                token_label,
+                is_success,
+                is_failed,
+                requests_remaining,
+                requests_used,
+                requests_last,
+                requests_remaining,
+                requests_used,
+                status_code,
+                (error_message or "")[:255] or None,
+                called_at_value,
+                called_at_value,
+                exhausted_at_value,
+                called_at_value,
+            ),
+        )
+
+
+def parse_odds_header_int(headers: Any, key: str) -> int | None:
+    try:
+        raw_value = headers.get(key)
+    except Exception:
+        raw_value = None
+    try:
+        return int(str(raw_value).strip()) if raw_value is not None and str(raw_value).strip() else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def fetch_odds_json_with_usage_log(
+    conn: pymysql.connections.Connection,
+    *,
+    path: str,
+    params: dict[str, Any],
+) -> Any:
+    if not ODDS_API_KEY:
+        raise HTTPException(status_code=500, detail="Missing THE_ODDS_API_KEY in backend.")
+
+    token_fingerprint, _token_label = build_odds_token_fingerprint()
+    query = {"apiKey": ODDS_API_KEY, **params}
+    endpoint = path if path.startswith("/") else f"/{path}"
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            response = await client.get(f"{ODDS_API_BASE_URL}{endpoint}", params=query)
+        requests_remaining = parse_odds_header_int(response.headers, "x-requests-remaining")
+        requests_used = parse_odds_header_int(response.headers, "x-requests-used")
+        requests_last = parse_odds_header_int(response.headers, "x-requests-last")
+        if response.status_code >= 400:
+            log_odds_api_call(
+                conn,
+                token_fingerprint=token_fingerprint,
+                endpoint=endpoint,
+                status_code=response.status_code,
+                requests_remaining=requests_remaining,
+                requests_used=requests_used,
+                requests_last=requests_last,
+                error_message=f"{response.text[:180]}",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"The Odds API error {response.status_code}: {response.text[:180]}",
+            )
+
+        log_odds_api_call(
+            conn,
+            token_fingerprint=token_fingerprint,
+            endpoint=endpoint,
+            status_code=response.status_code,
+            requests_remaining=requests_remaining,
+            requests_used=requests_used,
+            requests_last=requests_last,
+        )
+        return response.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_odds_api_call(
+            conn,
+            token_fingerprint=token_fingerprint,
+            endpoint=endpoint,
+            status_code=None,
+            requests_remaining=None,
+            requests_used=None,
+            requests_last=None,
+            error_message=f"{exc}",
+        )
+        raise
+
+
+def load_odds_usage_summary(conn: pymysql.connections.Connection) -> dict[str, Any]:
+    token_fingerprint, token_label = build_odds_token_fingerprint()
+    with conn.cursor() as cur:
+        current_row = {}
+        if token_fingerprint:
+            cur.execute(
+                """
+                SELECT
+                  token_fingerprint, token_label, total_calls, success_calls, failed_calls,
+                  last_requests_remaining, last_requests_used, last_requests_last,
+                  min_requests_remaining, max_requests_used, last_status_code, last_called_at, exhausted_at
+                FROM odds_api_token_usage
+                WHERE token_fingerprint = %s
+                LIMIT 1
+                """,
+                (token_fingerprint,),
+            )
+            current_row = cur.fetchone() or {}
+
+        cur.execute(
+            """
+            SELECT
+              token_fingerprint, token_label, total_calls, success_calls, failed_calls,
+              min_requests_remaining, max_requests_used, exhausted_at, last_called_at
+            FROM odds_api_token_usage
+            ORDER BY last_called_at DESC
+            LIMIT 8
+            """
+        )
+        token_history_rows = cur.fetchall() or []
+
+        cur.execute("SELECT COUNT(*) AS total_calls_all_time FROM odds_api_call_log")
+        all_time_row = cur.fetchone() or {}
+        cur.execute(
+            """
+            SELECT endpoint, status_code, requests_remaining, requests_used, requests_last, created_at
+            FROM odds_api_call_log
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+        latest_row = cur.fetchone() or {}
+
+    token_history = [
+        {
+            "tokenFingerprint": str(row.get("token_fingerprint") or ""),
+            "tokenLabel": str(row.get("token_label") or ""),
+            "totalCalls": int(row.get("total_calls") or 0),
+            "successCalls": int(row.get("success_calls") or 0),
+            "failedCalls": int(row.get("failed_calls") or 0),
+            "minRequestsRemaining": (
+                int(row.get("min_requests_remaining"))
+                if row.get("min_requests_remaining") is not None
+                else None
+            ),
+            "maxRequestsUsed": (
+                int(row.get("max_requests_used")) if row.get("max_requests_used") is not None else None
+            ),
+            "exhaustedAt": to_unix_ms(row.get("exhausted_at")),
+            "lastCalledAt": to_unix_ms(row.get("last_called_at")),
+        }
+        for row in token_history_rows
+    ]
+
+    return {
+        "currentTokenFingerprint": token_fingerprint,
+        "currentTokenLabel": (
+            str(current_row.get("token_label") or token_label)
+            if token_fingerprint
+            else ""
+        ),
+        "currentTokenCalls": int(current_row.get("total_calls") or 0),
+        "currentTokenSuccessCalls": int(current_row.get("success_calls") or 0),
+        "currentTokenFailedCalls": int(current_row.get("failed_calls") or 0),
+        "todayCalls": int(current_row.get("total_calls") or 0),
+        "todaySuccessCalls": int(current_row.get("success_calls") or 0),
+        "todayFailedCalls": int(current_row.get("failed_calls") or 0),
+        "allTimeCalls": int(all_time_row.get("total_calls_all_time") or 0),
+        "tokenHistory": token_history,
+        "requestsRemaining": (
+            int(current_row.get("last_requests_remaining"))
+            if current_row.get("last_requests_remaining") is not None
+            else None
+        ),
+        "requestsUsed": (
+            int(current_row.get("last_requests_used"))
+            if current_row.get("last_requests_used") is not None
+            else None
+        ),
+        "requestsLast": (
+            int(current_row.get("last_requests_last"))
+            if current_row.get("last_requests_last") is not None
+            else None
+        ),
+        "minRequestsRemaining": (
+            int(current_row.get("min_requests_remaining"))
+            if current_row.get("min_requests_remaining") is not None
+            else None
+        ),
+        "maxRequestsUsed": (
+            int(current_row.get("max_requests_used"))
+            if current_row.get("max_requests_used") is not None
+            else None
+        ),
+        "currentTokenExhaustedAt": (
+            to_unix_ms(current_row.get("exhausted_at"))
+            if current_row.get("exhausted_at") is not None
+            else None
+        ),
+        "lastEndpoint": str(latest_row.get("endpoint") or ""),
+        "lastStatusCode": (
+            int(latest_row.get("status_code")) if latest_row.get("status_code") is not None else None
+        ),
+        "lastCallAt": to_unix_ms(latest_row.get("created_at")),
+    }
+
+
 def find_matching_event(game: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any] | None:
     home_name = normalize_team_name(
         ((game.get("teams") or {}).get("home") or {}).get("team", {}).get("name")
@@ -678,11 +992,62 @@ def create_tables_if_needed() -> None:
       KEY idx_username_status (username, status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """
+    odds_call_log_sql = """
+    CREATE TABLE IF NOT EXISTS odds_api_call_log (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      token_fingerprint VARCHAR(80) NOT NULL DEFAULT '',
+      endpoint VARCHAR(120) NOT NULL,
+      status_code INT NULL,
+      requests_remaining INT NULL,
+      requests_used INT NULL,
+      requests_last INT NULL,
+      error_message VARCHAR(255) NULL,
+      created_at DATETIME NOT NULL,
+      KEY idx_token_fingerprint (token_fingerprint),
+      KEY idx_created_at (created_at),
+      KEY idx_status_code (status_code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    odds_token_usage_sql = """
+    CREATE TABLE IF NOT EXISTS odds_api_token_usage (
+      token_fingerprint VARCHAR(80) PRIMARY KEY,
+      token_label VARCHAR(24) NOT NULL,
+      total_calls INT NOT NULL DEFAULT 0,
+      success_calls INT NOT NULL DEFAULT 0,
+      failed_calls INT NOT NULL DEFAULT 0,
+      last_requests_remaining INT NULL,
+      last_requests_used INT NULL,
+      last_requests_last INT NULL,
+      min_requests_remaining INT NULL,
+      max_requests_used INT NULL,
+      last_status_code INT NULL,
+      last_error_message VARCHAR(255) NULL,
+      first_called_at DATETIME NOT NULL,
+      last_called_at DATETIME NOT NULL,
+      exhausted_at DATETIME NULL,
+      updated_at DATETIME NOT NULL,
+      KEY idx_last_called_at (last_called_at),
+      KEY idx_exhausted_at (exhausted_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(odds_sql)
             cur.execute(revoked_tokens_sql)
             cur.execute(recommendation_history_sql)
+            cur.execute(odds_call_log_sql)
+            cur.execute(odds_token_usage_sql)
+            cur.execute("SHOW COLUMNS FROM odds_api_call_log LIKE %s", ("token_fingerprint",))
+            if not cur.fetchone():
+                cur.execute(
+                    """
+                    ALTER TABLE odds_api_call_log
+                    ADD COLUMN token_fingerprint VARCHAR(80) NOT NULL DEFAULT ''
+                    """
+                )
+                cur.execute(
+                    "ALTER TABLE odds_api_call_log ADD KEY idx_token_fingerprint (token_fingerprint)"
+                )
             cur.execute("SHOW COLUMNS FROM recommendation_history LIKE %s", ("pick_domain",))
             if not cur.fetchone():
                 cur.execute(
@@ -958,16 +1323,21 @@ async def resolve_lines_for_game(
             return cached, cached_total, events_cache
 
     if events_cache is None:
-        raw_events = await fetch_odds_json("/sports/baseball_mlb/events", {})
+        raw_events = await fetch_odds_json_with_usage_log(
+            conn,
+            path="/sports/baseball_mlb/events",
+            params={},
+        )
         events_cache = raw_events if isinstance(raw_events, list) else []
 
     event = find_matching_event(game, events_cache)
     if not event or not event.get("id"):
         return {}, None, events_cache
 
-    odds_payload = await fetch_odds_json(
-        f"/sports/baseball_mlb/events/{event['id']}/odds",
-        {
+    odds_payload = await fetch_odds_json_with_usage_log(
+        conn,
+        path=f"/sports/baseball_mlb/events/{event['id']}/odds",
+        params={
             "regions": regions,
             "markets": "pitcher_strikeouts,totals",
             "oddsFormat": "american",
@@ -1177,13 +1547,30 @@ async def weather_by_games(
     return {"weatherByGamePk": weather_payload}
 
 
+@app.get("/odds/usage/summary")
+def odds_usage_summary(
+    _auth_payload: dict[str, Any] = Depends(require_authenticated_user),
+) -> dict[str, Any]:
+    try:
+        with db_conn() as conn:
+            summary = load_odds_usage_summary(conn)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected odds usage backend error: {exc}") from exc
+    return summary
+
+
 @app.post("/odds/lines/by-games")
 async def odds_lines_by_games(
     req: OddsByGamesRequest,
     _auth_payload: dict[str, Any] = Depends(require_authenticated_user),
 ) -> dict[str, Any]:
     if not req.games:
-        return {"linesByPitcherId": {}, "totalsByGamePk": {}}
+        try:
+            with db_conn() as conn:
+                usage_summary = load_odds_usage_summary(conn)
+        except Exception:
+            usage_summary = {}
+        return {"linesByPitcherId": {}, "totalsByGamePk": {}, "usageSummary": usage_summary}
 
     lines_by_pitcher_id: dict[str, dict[str, Any]] = {}
     totals_by_game_pk: dict[str, dict[str, Any]] = {}
@@ -1210,9 +1597,14 @@ async def odds_lines_by_games(
                         totals_by_game_pk[str(game_pk)] = totals_node
                 except Exception:
                     continue
+            usage_summary = load_odds_usage_summary(conn)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unexpected backend error: {exc}") from exc
 
-    return {"linesByPitcherId": lines_by_pitcher_id, "totalsByGamePk": totals_by_game_pk}
+    return {
+        "linesByPitcherId": lines_by_pitcher_id,
+        "totalsByGamePk": totals_by_game_pk,
+        "usageSummary": usage_summary,
+    }
