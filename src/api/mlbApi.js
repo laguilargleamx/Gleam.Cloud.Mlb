@@ -1815,27 +1815,33 @@ function estimateBullpenAvailability(appearances, targetDate) {
   };
 }
 
-async function fetchTeamBullpenProbables(team, gameDate) {
+async function fetchTeamBullpenProbables(team, gameDate, currentGamePk = 0) {
   const teamId = Number(team?.id || 0);
   const teamName = team?.name || "Equipo";
   if (!teamId || !gameDate) {
     return { teamId, teamName, pitchers: [] };
   }
   const season = gameDate.slice(0, 4);
-  const cacheKey = `${teamId}-${gameDate}`;
+  const cacheKey = `${teamId}-${gameDate}-${Number(currentGamePk || 0)}`;
   const cached = teamBullpenProbablesCache.get(cacheKey);
   if (cached !== undefined) {
     return cached;
   }
 
-  const [activePitchers, recentGames] = await Promise.all([
+  const normalizedCurrentGamePk = Number(currentGamePk || 0);
+  const [activePitchers, recentGames, currentGameUsage] = await Promise.all([
     fetchTeamActivePitchers(teamId, season),
-    fetchTeamRecentGames(teamId, gameDate, 7)
+    fetchTeamRecentGames(teamId, gameDate, 7),
+    normalizedCurrentGamePk ? fetchGameBullpenUsage(normalizedCurrentGamePk, teamId) : Promise.resolve([])
   ]);
+  const activePitchersById = Object.fromEntries(
+    activePitchers.map((pitcher) => [Number(pitcher.pitcherId), pitcher])
+  );
   const bullpenAppearancesByPitcherId = {};
   const gameUsageRows = await Promise.all(
     recentGames.map((recentGame) => fetchGameBullpenUsage(recentGame.gamePk, teamId))
   );
+  gameUsageRows.push(currentGameUsage);
   for (const usageRows of gameUsageRows) {
     for (const row of usageRows) {
       if (!bullpenAppearancesByPitcherId[row.pitcherId]) {
@@ -1866,10 +1872,38 @@ async function fetchTeamBullpenProbables(team, gameDate) {
     .sort((a, b) => b.probability - a.probability)
     .slice(0, 6);
 
+  const liveUsageByPitcherId = Object.fromEntries(
+    (currentGameUsage ?? []).map((row) => [Number(row?.pitcherId || 0), row]).filter(([pitcherId]) => pitcherId)
+  );
+  const livePitchers = Object.values(liveUsageByPitcherId)
+    .map((usageRow) => {
+      const pitcherId = Number(usageRow?.pitcherId || 0);
+      const baseNode = activePitchersById[pitcherId];
+      return {
+        pitcherId,
+        fullName: baseNode?.fullName || usageRow?.fullName || "Pitcher",
+        era: baseNode?.era ?? null,
+        inningsPitched: baseNode?.inningsPitched || "-",
+        probability: 96,
+        status: "en vivo",
+        daysSinceLast: 0,
+        pitchesLast: Number(usageRow?.pitches || 0),
+        appearancesLast7: Math.max(
+          1,
+          (bullpenAppearancesByPitcherId[pitcherId]?.length || 0)
+        )
+      };
+    })
+    .filter((node) => node.pitcherId);
+  const livePitcherIdSet = new Set(livePitchers.map((node) => node.pitcherId));
+  const mergedPitchers = [...livePitchers, ...probablePitchers.filter((node) => !livePitcherIdSet.has(node.pitcherId))]
+    .sort((a, b) => b.probability - a.probability)
+    .slice(0, 8);
+
   const result = {
     teamId,
     teamName,
-    pitchers: probablePitchers,
+    pitchers: mergedPitchers,
     updatedAt: Date.now()
   };
   teamBullpenProbablesCache.set(cacheKey, result);
@@ -1892,8 +1926,8 @@ export async function fetchBullpenProbablesForGame(game) {
     const awayTeam = game?.teams?.away?.team;
     const homeTeam = game?.teams?.home?.team;
     const [awayBullpen, homeBullpen] = await Promise.all([
-      fetchTeamBullpenProbables(awayTeam, gameDate),
-      fetchTeamBullpenProbables(homeTeam, gameDate)
+      fetchTeamBullpenProbables(awayTeam, gameDate, gamePk),
+      fetchTeamBullpenProbables(homeTeam, gameDate, gamePk)
     ]);
     const payload = {
       gamePk,
