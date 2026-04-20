@@ -21,7 +21,9 @@ from pymysql.cursors import DictCursor
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(BASE_DIR / ".env", override=True)
+# Keep local development convenience, but never override runtime env vars
+# injected by the platform (e.g. Railway production variables).
+load_dotenv(BASE_DIR / ".env", override=False)
 
 ODDS_API_BASE_URL = (os.getenv("THE_ODDS_API_BASE_URL") or "https://api.the-odds-api.com/v4").rstrip("/")
 ODDS_API_KEY = (os.getenv("THE_ODDS_API_KEY") or "").strip()

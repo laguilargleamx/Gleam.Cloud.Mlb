@@ -2146,6 +2146,13 @@ export default function App() {
         >
           Dashboard
         </button>
+        <button
+          type="button"
+          className={`games-view-button ${activeMainView === "settings" ? "active" : ""}`}
+          onClick={() => setActiveMainView("settings")}
+        >
+          Settings
+        </button>
       </div>
       {activeMainView === "top" ? (
         <section className="history-panel">
@@ -2468,6 +2475,78 @@ export default function App() {
                     <strong>{row.username}</strong>
                     <span>{Number(row.totalCalls || 0)} llamadas</span>
                     <small>Ultima: {formatUnixDateTimeLabel(row.lastCallAt)}</small>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      ) : null}
+      {activeMainView === "settings" ? (
+        <section className="history-panel settings-panel">
+          <div className="history-header-row">
+            <strong>Settings</strong>
+          </div>
+          <p className="history-summary">
+            Identificador del token activo y estado de uso de The Odds API para validar que la app use la
+            llave correcta.
+          </p>
+          <div className="settings-grid">
+            <article className="settings-card">
+              <span className="settings-label">Token activo (label)</span>
+              <strong className="settings-value">
+                {`${oddsApiUsage?.currentTokenLabel || ""}`.trim() || "No disponible"}
+              </strong>
+            </article>
+            <article className="settings-card">
+              <span className="settings-label">Fingerprint activo</span>
+              <strong className="settings-value settings-mono">
+                {`${oddsApiUsage?.currentTokenFingerprint || ""}`.trim() || "No disponible"}
+              </strong>
+            </article>
+            <article className="settings-card">
+              <span className="settings-label">Ultimo status The Odds API</span>
+              <strong className="settings-value">
+                {Number.isFinite(Number(oddsApiUsage?.lastStatusCode))
+                  ? `${Number(oddsApiUsage?.lastStatusCode)}`
+                  : "No disponible"}
+              </strong>
+              <small>
+                Ultima llamada: {formatUnixDateTimeLabel(oddsApiUsage?.lastCallAt)} · Endpoint:{" "}
+                {`${oddsApiUsage?.lastEndpoint || ""}`.trim() || "-"}
+              </small>
+            </article>
+            <article className="settings-card">
+              <span className="settings-label">Cuota actual</span>
+              <strong className="settings-value">
+                Restantes{" "}
+                {Number.isFinite(Number(oddsApiUsage?.requestsRemaining))
+                  ? `${Number(oddsApiUsage?.requestsRemaining)}`
+                  : "--"}
+              </strong>
+              <small>
+                Usadas:{" "}
+                {Number.isFinite(Number(oddsApiUsage?.requestsUsed))
+                  ? `${Number(oddsApiUsage?.requestsUsed)}`
+                  : "--"}{" "}
+                · Ultimo costo:{" "}
+                {Number.isFinite(Number(oddsApiUsage?.requestsLast))
+                  ? `${Number(oddsApiUsage?.requestsLast)}`
+                  : "--"}
+              </small>
+            </article>
+          </div>
+          <div className="settings-token-history">
+            <h3>Historial reciente de tokens</h3>
+            {!Array.isArray(oddsApiUsage?.tokenHistory) || !oddsApiUsage.tokenHistory.length ? (
+              <p className="dashboard-empty">Sin historial de tokens aun.</p>
+            ) : (
+              <div className="dashboard-users-list">
+                {oddsApiUsage.tokenHistory.map((row) => (
+                  <article key={row.tokenFingerprint || row.tokenLabel} className="dashboard-user-row">
+                    <strong>{row.tokenLabel || "token"}</strong>
+                    <span>{Number(row.totalCalls || 0)} llamadas</span>
+                    <small>Ultima: {formatUnixDateTimeLabel(row.lastCalledAt)}</small>
                   </article>
                 ))}
               </div>

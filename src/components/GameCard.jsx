@@ -339,48 +339,13 @@ function computeBullpenWeightedEra(teamBullpen) {
   return weightedEra / weightTotal;
 }
 
-function computeLineupOffenseIndex(players, statsByPlayerId) {
-  const rows = (players ?? [])
-    .map((player) => statsByPlayerId?.[player?.playerId])
-    .filter(Boolean);
-  if (!rows.length) {
-    return {
-      offenseFactor: 1,
-      avgObp: 0.315,
-      avgOps: 0.72
-    };
-  }
-  let obpSum = 0;
-  let opsSum = 0;
-  for (const stat of rows) {
-    const obp = Number(stat?.obp);
-    const ops = Number(stat?.ops);
-    obpSum += Number.isFinite(obp) && obp > 0 ? obp : 0.315;
-    opsSum += Number.isFinite(ops) && ops > 0 ? ops : 0.72;
-  }
-  const avgObp = obpSum / rows.length;
-  const avgOps = opsSum / rows.length;
-  const obpDelta = avgObp - 0.315;
-  const opsDelta = avgOps - 0.72;
-  const offenseFactor = clampProbability(1 + obpDelta * 1.6 + opsDelta * 0.65, 0.83, 1.22);
-  return { offenseFactor, avgObp, avgOps };
-}
-
 function buildRunProjectionModel({
-  lineups,
-  lineupStatsByPlayerId,
   awayStarterEra,
   homeStarterEra,
   awayBullpen,
   homeBullpen,
   sportsbookTotalLine
 }) {
-  if (!lineups?.away?.length || !lineups?.home?.length) {
-    return null;
-  }
-  const awayOffense = computeLineupOffenseIndex(lineups.away, lineupStatsByPlayerId);
-  const homeOffense = computeLineupOffenseIndex(lineups.home, lineupStatsByPlayerId);
-
   const awayStarterFactor = clampProbability(1 + (normalizeEraValue(homeStarterEra) - 4.0) * 0.085, 0.78, 1.28);
   const homeStarterFactor = clampProbability(1 + (normalizeEraValue(awayStarterEra) - 4.0) * 0.085, 0.78, 1.28);
 
@@ -391,12 +356,12 @@ function buildRunProjectionModel({
 
   const baseRunsPerTeam = 4.25;
   const awayRuns = clampProbability(
-    baseRunsPerTeam * awayOffense.offenseFactor * awayStarterFactor * awayBullpenFactor,
+    baseRunsPerTeam * awayStarterFactor * awayBullpenFactor,
     1.6,
     8.4
   );
   const homeRuns = clampProbability(
-    baseRunsPerTeam * homeOffense.offenseFactor * homeStarterFactor * homeBullpenFactor,
+    baseRunsPerTeam * homeStarterFactor * homeBullpenFactor,
     1.6,
     8.4
   );
@@ -412,18 +377,6 @@ function buildRunProjectionModel({
     : "Nula";
   const edge = hasSportsbookLine ? Math.abs(totalRuns - baselineLine) : 0;
   const confidence = lean === "Nula" ? 0.5 : clampProbability(0.51 + edge * 0.09, 0.51, 0.68);
-  const awayAttackLevel =
-    awayOffense.offenseFactor >= 1.06
-      ? "fuerte"
-      : awayOffense.offenseFactor <= 0.95
-        ? "baja"
-        : "normal";
-  const homeAttackLevel =
-    homeOffense.offenseFactor >= 1.06
-      ? "fuerte"
-      : homeOffense.offenseFactor <= 0.95
-        ? "baja"
-        : "normal";
   const leanLabel = !hasSportsbookLine
     ? "Sin linea del sportsbook para comparar"
     : lean === "Over"
@@ -432,16 +385,16 @@ function buildRunProjectionModel({
         ? "Nos inclinamos al Under"
         : "Sin ventaja clara";
   const plainExplanation = hasSportsbookLine
-    ? `Proyectamos un juego de ${totalRuns.toFixed(1)} carreras. ${leanLabel} con confianza ${Math.round(confidence * 100)}%.`
-    : `Proyectamos ${totalRuns.toFixed(1)} carreras, pero no hay linea del sportsbook para evaluar Over/Under.`;
+    ? `Proyectamos un juego de ${totalRuns.toFixed(1)} carreras usando abridores y bullpen probable. ${leanLabel} con confianza ${Math.round(confidence * 100)}%.`
+    : `Proyectamos ${totalRuns.toFixed(1)} carreras usando abridores y bullpen probable, pero no hay linea del sportsbook para evaluar Over/Under.`;
 
   const reasons = [
     hasSportsbookLine
       ? `Comparamos nuestra proyeccion (${totalRuns.toFixed(1)}) contra la linea de sportsbook (${baselineLine.toFixed(1)}).`
       : "No hay linea de sportsbook disponible para total de carreras en este juego.",
-    `La visita llega con ataque ${awayAttackLevel}, y el local con ataque ${homeAttackLevel}.`,
     `Los abridores proyectan ${normalizeEraValue(homeStarterEra).toFixed(2)} y ${normalizeEraValue(awayStarterEra).toFixed(2)} de ERA.`,
-    `El bullpen probable pinta en ${awayBullpenEra.toFixed(2)} y ${homeBullpenEra.toFixed(2)} de ERA para cerrar el juego.`
+    `El bullpen probable pinta en ${awayBullpenEra.toFixed(2)} y ${homeBullpenEra.toFixed(2)} de ERA para cerrar el juego.`,
+    "Esta proyeccion no usa estadisticas de bateadores ni lineups."
   ];
 
   return {
@@ -1330,18 +1283,15 @@ export default function GameCard({
     }
     setRunsProjectionLoading(true);
     setRunsProjectionError("");
-    const [lineupPayload, loadedBullpen] = await Promise.all([
-      ensureLineupDataLoaded(),
-      bullpenProbables ? Promise.resolve(bullpenProbables) : fetchBullpenProbablesForGame(game)
-    ]);
-    const loadedLineups = lineupPayload?.lineups ?? null;
-    const loadedStatsByPlayerId = lineupPayload?.statsByPlayerId ?? lineupStatsByPlayerId;
+    const loadedBullpen = await (bullpenProbables
+      ? Promise.resolve(bullpenProbables)
+      : fetchBullpenProbablesForGame(game));
     const bullpenPayload = loadedBullpen || bullpenProbables;
     if (!bullpenProbables && loadedBullpen) {
       setBullpenProbables(loadedBullpen);
     }
-    if (!loadedLineups || !bullpenPayload) {
-      setRunsProjectionError("No hay suficientes datos para proyectar carreras.");
+    if (!bullpenPayload) {
+      setRunsProjectionError("No hay suficientes datos de bullpen para proyectar carreras.");
       setRunsProjectionLoading(false);
       return;
     }
@@ -1360,8 +1310,6 @@ export default function GameCard({
       return;
     }
     const model = buildRunProjectionModel({
-      lineups: loadedLineups,
-      lineupStatsByPlayerId: loadedStatsByPlayerId,
       awayStarterEra: awayStarterEraValue,
       homeStarterEra: homeStarterEraValue,
       awayBullpen: bullpenPayload?.away,
